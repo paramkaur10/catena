@@ -27,3 +27,7 @@ data/srf/iride_heo_argotec.csv
 
 # notebooks are scratch work: they live in ~/projects/catena_lab/notebooks
 *.ipynb
+
+# links to folders that live outside the repo (no trailing slash: git sees links as files)
+/catena_data
+/catena_lab
