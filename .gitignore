@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# data lives in $CATENA_DATA, never in git
+*.tif
+*.tiff
+*.zip
+*.tar.gz
+*.taco
+*.npy
+*.npz
+*.h5
+*.pt
+*.ckpt
+*.onnx
+*.xlsx
+
+# Argotec's curves stay private
+data/srf/iride_heo_argotec.csv
+
+# notebooks are scratch work: they live in ~/projects/catena_lab/notebooks
+*.ipynb
