@@ -1,0 +1,116 @@
+# D1: where every dataset comes from. The key is also its folder: $CATENA_DATA/raw/<key>/
+#   zenodo  a Zenodo record; files, sizes and md5 checksums come from Zenodo's API
+#   hf      a Hugging Face repo and file patterns, downloaded at a pinned revision
+#   page    every link on a web page whose path matches `pattern` (a regular expression)
+#   manual  you put it in raw/<key>/ yourself; the note says how
+# `sensor` is the spec id in catena/sensors/specs: the imaging chain behind the pixels.
+# Roles: training = CloudSEN12+, L8 Biome, CloudPeru2, IRIDE HEO; test on sensors the model
+# never saw = IRIDE Eaglet II, Phi-sat-2, L7 Irish.
+
+# CloudSEN12+: the L1C files are 95 GB (hand-labelled, scribble and unlabelled patches);
+# D2 (catena.data.cloudsen12) copies out the 10,847 hand-labelled ones.
+cloudsen12plus:
+  name: CloudSEN12+ (Sentinel-2 L1C part, with labels)
+  sensor: sentinel2_msi
+  method: hf
+  repo: tacofoundation/cloudsen12
+  repo_type: dataset
+  patterns: ["*l1c*"]
+  licence: CC0-1.0
+  cite: Aybar C. et al. (2024) CloudSEN12+, Data in Brief 56 110852
+
+kappaset:
+  name: KappaSet (Sentinel-2 L1C, 512 x 512 sub-tiles)
+  sensor: sentinel2_msi
+  method: zenodo
+  record: 7100327
+  licence: CC-BY-4.0
+  cite: Domnich M. et al. (2021) KappaMask, Remote Sensing 13(20) 4100
+
+s2_cloud_mask_catalogue:
+  name: Sentinel-2 Cloud Mask Catalogue (optional)
+  sensor: sentinel2_msi
+  method: zenodo
+  record: 4172870
+  licence: see the Zenodo record
+  cite: Francis A., Mrziglod J. et al. (2020) Sentinel-2 Cloud Mask Catalogue, Zenodo
+
+# Biome: the page lists one .tar.gz per scene (96 on 26 Oct 2026), pre-collection L1T with
+# MTL. Mask codes, from that page: 0 fill, 64 shadow, 128 clear, 192 thin, 255 cloud.
+l8_biome:
+  name: L8 Biome cloud validation masks (96 scenes)
+  sensor: landsat8_oli
+  method: page
+  page: https://landsat.usgs.gov/landsat-8-cloud-cover-assessment-validation-data
+  pattern: '\.tar\.gz$'
+  licence: USGS, public domain
+  cite: Foga S. et al. (2017) Remote Sensing of Environment 194 379-390
+
+# Not Biome again: 48 other L8 scenes, Collection 2 (today's calibration), one analyst, no
+# shadow class (0 fill, 128 clear, 192 thin, 255 cloud). Optional extra L8 training data.
+l8_c2_truth:
+  name: L8 Collection 2 cloud truth masks (48 scenes, optional)
+  sensor: landsat8_oli
+  method: manual
+  note: >-
+    USGS data release doi:10.5066/P9FI4A0Y; download by hand into
+    $CATENA_DATA/raw/l8_c2_truth
+  licence: CC0-1.0
+  cite: Scaramuzza P. (2021) Landsat 8 Collection 2 cloud truth mask validation set, USGS
+
+# L7 Irish: 206 scenes on the page (26 Oct 2026), Level-1G pre-collection, in nine latitude
+# zones, with MTL; the same mask codes as Biome. A test set: 30 m, a sensor never trained on.
+l7_irish:
+  name: L7 Irish cloud validation masks (206 scenes)
+  sensor: landsat7_etm
+  method: page
+  page: https://landsat.usgs.gov/node/8
+  pattern: '\.tar\.gz$'
+  licence: USGS, public domain
+  cite: Irish R.R. et al. (2006) Photogrammetric Engineering and Remote Sensing 72(10) 1179-1188
+
+cloudperu2:
+  name: CloudPeru2 (PeruSat-1)
+  sensor: perusat1
+  method: manual
+  note: >-
+    CloudPeru2.zip (14,440,301,766 bytes) from the authors' Box folder
+    https://aston.app.box.com/s/ursf96cv2ongsc2rqgldtx14jtbihsgk; kept zipped in raw/cloudperu2
+
+iride_heo:
+  name: IRIDE HEO L1C products (OmniCloudMask pre-labels are made here)
+  sensor: iride_heo
+  method: manual
+  note: >-
+    L1C product zips from the IRIDE team, kept zipped in raw/iride_heo/products,
+    with catalog.csv and sources.csv beside them
+
+iride_eaglet2:
+  name: IRIDE Eaglet II L1C products (OmniCloudMask pre-labels are made here)
+  sensor: iride_eaglet2
+  method: manual
+  note: >-
+    L1C product zips from the IRIDE team, kept zipped in raw/iride_eaglet2/products,
+    with catalog.csv and sources.csv beside them
+
+phisat2:
+  name: Phi-sat-2 L1 products (test set; labelled like Eaglet II)
+  sensor: phisat2
+  method: manual
+  note: >-
+    real Phi-sat-2 products from ESA (Insula; access to arrange), into $CATENA_DATA/raw/phisat2;
+    labels: OmniCloudMask draft, then corrected by hand
+
+gf2ms_whu:
+  name: GF2MS-WHU (Gaofen-2, extra unseen-sensor test)
+  sensor: gaofen2
+  method: manual
+  note: >-
+    log in to IEEE DataPort (doi 10.21227/8vc2-yf66), download, unpack into
+    $CATENA_DATA/raw/gf2ms_whu
+
+phisat2_sim:
+  name: Phi-sat-2 simulated core set (OrbitalAI)
+  sensor: phisat2
+  method: manual
+  note: optional, later; put it in $CATENA_DATA/raw/phisat2_sim
