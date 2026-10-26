@@ -1,18 +1,23 @@
-"""OmniCloudMask drafts for IRIDE products, written into one folder per scene.
+"""OmniCloudMask drafts for IRIDE and Phi-sat-2 products, written into one folder per scene.
 
     python scripts/ocm_prelabel.py PRODUCTS_FOLDER LABELS_FOLDER [--nir-from zeros|blue|red]
                                    [--res 5] [--device cuda:0] [--redo]
 
-For HEO the drafts become training labels after review; for Eaglet II they are first drafts
-of the test labels, which a person then corrects. For every product zip in PRODUCTS_FOLDER:
+For HEO the drafts become training labels after review; for Eaglet II and Phi-sat-2 they are
+first drafts of the test labels, which a person then corrects. For every product zip in
+PRODUCTS_FOLDER:
   1. read red, green and NIR. HEO: B03, B02, B07. Eaglet II has no NIR band, so that input
      is filled as --nir-from says: zeros (as the OmniCloudMask documentation suggests) or a
-     copy of the blue or red band (ECLIPSE used blue);
+     copy of the blue or red band (ECLIPSE used blue). Phi-sat-2: Band_3, Band_2 and
+     Band_7 of the BC multiband file, as top-of-atmosphere reflectance (catena.data.phisat2);
   2. resample to --res metres (5 m is the finest OmniCloudMask supports), averaging only
-     valid pixels, so swath edges do not darken;
-  3. predict with OmniCloudMask, model version 4.0 (pinned, for reproducibility);
+     valid pixels, so swath edges do not darken. Phi-sat-2 stays on its own grid (about
+     4.75 m, in longitude and latitude), so its draft fits its pixels one to one;
+  3. predict with OmniCloudMask, model version 4.0 (pinned, for reproducibility). It
+     rescales every tile band by band to zero mean and unit spread, so the units of the
+     inputs (DN, radiance or reflectance) do not matter, only that 0 means no data;
   4. write into LABELS_FOLDER/<scene>/, where <scene> is the satellite and the start time
-     of the acquisition (e.g. IMH02_20261009T133222):
+     of the acquisition (e.g. IMH02_20261009T133222, PHISAT2_20261025T171555):
        <draft>.tif       classes, OmniCloudMask's codes: 0 clear, 1 thick cloud,
                          2 thin cloud, 3 cloud shadow; 255 = no data
        <draft>.conf.tif  the 4 class probabilities x 250 as uint8; 255 = no data
@@ -47,6 +52,8 @@ from rasterio.enums import Resampling
 from rasterio.transform import Affine
 from rasterio.warp import reproject
 
+from catena.data import phisat2
+
 MODEL_VERSION = 4.0
 NAMES = ("clear", "thick", "thin", "shadow")
 COLOURS = {1: (1.0, 0.1, 0.1), 2: (1.0, 0.85, 0.0), 3: (0.1, 0.4, 1.0)}  # thick, thin, shadow
@@ -58,6 +65,8 @@ DRAFT_COLUMNS = ["scene", "draft", "valid", *NAMES, "inputs", "made_utc"]
 
 def scene_id(product: Path) -> str:
     """Satellite and start time: IMH02_1CST__OPT8_20261009T133222_... -> IMH02_20261009T133222."""
+    if phisat2.is_product(product):
+        return phisat2.open_product(product).scene
     tokens = [t for t in product.stem.split("_") if t]
     stamps = [t for t in tokens if STAMP.match(t)]
     return f"{tokens[0]}_{stamps[0]}" if stamps else product.stem
@@ -156,9 +165,20 @@ def write_rows(path: Path, rows: list[dict], columns: list[str]) -> None:
 
 def draft_one(product: Path, folder: Path, draft: str, args, predict) -> dict:
     """Run OmniCloudMask on one product and write its draft; returns its drafts.csv row."""
-    paths, inputs = band_paths(product)
-    grid = target_grid(paths["red"][0], args.res)
-    bands = {k: resampled(p, i, grid) for k, (p, i) in paths.items()}
+    if phisat2.is_product(product):
+        item = phisat2.open_product(product)
+        info = phisat2.describe(item)
+        rho = phisat2.reflectance(item, (4, 3, 8, 2), info)  # red, green, NIR, blue
+        bands = dict(zip(("red", "green", "nir", "blue"), rho, strict=True))
+        grid = phisat2.grid(item)
+        inputs = "Phi-sat-2: red Band_3, green Band_2, NIR Band_7, TOA reflectance"
+        east, north = info["pixel_m"]
+        resampling = f"none: the product's own grid, {east:.2f} x {north:.2f} m"
+    else:
+        paths, inputs = band_paths(product)
+        grid = target_grid(paths["red"][0], args.res)
+        bands = {k: resampled(p, i, grid) for k, (p, i) in paths.items()}
+        resampling = f"mean of valid pixels to {args.res:g} m"
     nir = bands.get("nir")
     if nir is None:
         fill = args.nir_from
@@ -178,7 +198,7 @@ def draft_one(product: Path, folder: Path, draft: str, args, predict) -> dict:
         "labeller": f"omnicloudmask {version('omnicloudmask')}, model {MODEL_VERSION}",
         "torch": version("torch"),
         "inputs": inputs,
-        "resampling": f"mean of valid pixels to {args.res:g} m",
+        "resampling": resampling,
         "classes": "0 clear, 1 thick cloud, 2 thin cloud, 3 cloud shadow, 255 no data",
         "made_utc": made,
         "product": product.stem,
@@ -227,8 +247,8 @@ def main() -> None:
     predict = None
     made, skipped = [], 0
     for scene, product in scenes.items():
-        paths, _ = band_paths(product)
-        draft = f"ocm{int(MODEL_VERSION)}" + ("" if "nir" in paths else f"_nir{args.nir_from}")
+        has_nir = phisat2.is_product(product) or "nir" in band_paths(product)[0]
+        draft = f"ocm{int(MODEL_VERSION)}" + ("" if has_nir else f"_nir{args.nir_from}")
         folder = args.labels / scene
         if (folder / f"{draft}.tif").exists() and not args.redo:
             skipped += 1
@@ -244,6 +264,10 @@ def main() -> None:
             )
         if scene not in known:
             info = catalog.get(product.stem, {})
+            if phisat2.is_product(product):
+                where = phisat2.describe(phisat2.open_product(product))
+                info = {"lat": round(where["lat"], 5), "lon": round(where["lon"], 5)}
+                info["view:sun_elevation"] = round(90 - where["sun_zenith"], 2)
             row = {"scene": scene, "product": product.name, "satellite": scene.split("_")[0]}
             row["start"] = scene.split("_")[-1]
             row |= {"lat": info.get("lat", ""), "lon": info.get("lon", "")}
