@@ -1,0 +1,86 @@
+# Sentinel-2 MSI, Level-1C top-of-atmosphere reflectance.
+#
+# Spectral edges: S2A band centre +/- bandwidth/2. SNR at Lref and the saturation level
+# Lmax are mission requirements; in-flight SNR is higher. MTF: only the requirement window
+# is known here; in-flight values can replace it later (data quality reports, or A5).
+id: sentinel2_msi
+name: Sentinel-2 MSI
+platform: Sentinel-2A/B/C
+
+sources:
+  wiki_s2: "Wikipedia, Sentinel-2: S2A band centres and widths, GSD, orbit, 12-bit. https://en.wikipedia.org/wiki/Sentinel-2"
+  esa_msi: "ESA Sentinel-2 MSI technical guide: Lref, SNR at Lref, Lmax; MTF and registration requirements. https://sentinel.esa.int/web/sentinel/technical-guides/sentinel-2-msi/msi-instrument"
+  esa_dqr2015: "ESA Sentinel-2 MSI Data Quality Report, Dec 2015: B02-B03 registration 0.23 px"
+  dea_s2a: "Digital Earth Australia, metadata of an S2A L1C product, processing baseline 02.09 (solar irradiance per band). https://explorer.nci.dea.ga.gov.au/dataset/b5241144-fbd3-5683-a7cd-f980270990cc"
+  esa_pb04: "ESA, Sentinel-2 processing baseline 04.00 (Jan 2022): L1C reflectance = (DN - 1000) / 10000"
+
+instrument:
+  imaging: pushbroom
+  adc_bits: {value: 12, kind: nominal, source: wiki_s2}
+  altitude_km: {value: 786, kind: nominal, source: wiki_s2}
+
+product:
+  level: L1C
+  units: toa_reflectance
+  dtype: uint16
+  scale: 0.0001
+  offset: -0.1
+  nodata: 0
+  note: "Offset -0.1 from processing baseline 04.00 (esa_pb04); earlier products have offset 0."
+
+processing: null  # not documented here yet
+
+defaults:
+  spectral: {kind: nominal, source: wiki_s2}
+  gsd_m: {kind: nominal, source: wiki_s2}
+  pixel_m: {kind: nominal, source: wiki_s2}
+  snr: {kind: requirement, source: esa_msi}
+  saturation_radiance: {kind: nominal, source: esa_msi}
+  e0: {kind: nominal, source: dea_s2a}
+  registration_sigma_px: {range: [null, 0.1], kind: requirement, source: esa_msi,
+                          note: "< 0.3 px at 3 sigma; 0.23 px measured for B02-B03 (esa_dqr2015)"}
+
+# MTF requirement at Nyquist: 0.15-0.30 for the 10 m bands, below 0.45 for 20 m and 60 m.
+_mtf_10m: &mtf10 {range: [0.15, 0.30], kind: requirement, source: esa_msi}
+_mtf_coarse: &mtfc {range: [null, 0.45], kind: requirement, source: esa_msi}
+
+bands:
+  - {name: B01, common_name: coastal, spectral: {range: [432.2, 453.2]}, gsd_m: 60, pixel_m: 60,
+     mtf_along: *mtfc, mtf_across: *mtfc, snr: [{snr: 129, radiance: 129}],
+     saturation_radiance: 588, e0: 1884.69}
+  - {name: B02, common_name: blue, spectral: {range: [459.4, 525.4]}, gsd_m: 10, pixel_m: 10,
+     mtf_along: *mtf10, mtf_across: *mtf10, snr: [{snr: 154, radiance: 128}],
+     saturation_radiance: 615.5, e0: 1959.66}
+  - {name: B03, common_name: green, spectral: {range: [541.8, 577.8]}, gsd_m: 10, pixel_m: 10,
+     mtf_along: *mtf10, mtf_across: *mtf10, snr: [{snr: 168, radiance: 128}],
+     saturation_radiance: 559, e0: 1823.24}
+  - {name: B04, common_name: red, spectral: {range: [649.1, 680.1]}, gsd_m: 10, pixel_m: 10,
+     mtf_along: *mtf10, mtf_across: *mtf10, snr: [{snr: 142, radiance: 108}],
+     saturation_radiance: 484, e0: 1512.06}
+  - {name: B05, common_name: rededge1, spectral: {range: [696.6, 711.6]}, gsd_m: 20, pixel_m: 20,
+     mtf_along: *mtfc, mtf_across: *mtfc, snr: [{snr: 117, radiance: 74.5}],
+     saturation_radiance: 449.5, e0: 1424.64}
+  - {name: B06, common_name: rededge2, spectral: {range: [733.0, 748.0]}, gsd_m: 20, pixel_m: 20,
+     mtf_along: *mtfc, mtf_across: *mtfc, snr: [{snr: 89, radiance: 68}],
+     saturation_radiance: 413, e0: 1287.61}
+  - {name: B07, common_name: rededge3, spectral: {range: [772.8, 792.8]}, gsd_m: 20, pixel_m: 20,
+     mtf_along: *mtfc, mtf_across: *mtfc, snr: [{snr: 105, radiance: 67}],
+     saturation_radiance: 387, e0: 1162.08}
+  - {name: B08, common_name: nir, spectral: {range: [779.8, 885.8]}, gsd_m: 10, pixel_m: 10,
+     mtf_along: *mtf10, mtf_across: *mtf10, snr: [{snr: 174, radiance: 103}],
+     saturation_radiance: 308, e0: 1041.63}
+  - {name: B8A, common_name: nir_narrow, spectral: {range: [854.2, 875.2]}, gsd_m: 20, pixel_m: 20,
+     mtf_along: *mtfc, mtf_across: *mtfc, snr: [{snr: 72, radiance: 52.5}],
+     saturation_radiance: 308, e0: 955.32}
+  - {name: B09, common_name: water_vapour, spectral: {range: [935.1, 955.1]}, gsd_m: 60, pixel_m: 60,
+     mtf_along: *mtfc, mtf_across: *mtfc, snr: [{snr: 114, radiance: 9}],
+     saturation_radiance: 233, e0: 812.92}
+  - {name: B10, common_name: cirrus, spectral: {range: [1358.0, 1389.0]}, gsd_m: 60, pixel_m: 60,
+     mtf_along: *mtfc, mtf_across: *mtfc, snr: [{snr: 50, radiance: 6}],
+     saturation_radiance: 45, e0: 367.15}
+  - {name: B11, common_name: swir1, spectral: {range: [1568.2, 1659.2]}, gsd_m: 20, pixel_m: 20,
+     mtf_along: *mtfc, mtf_across: *mtfc, snr: [{snr: 100, radiance: 4}],
+     saturation_radiance: 70, e0: 245.59}
+  - {name: B12, common_name: swir2, spectral: {range: [2114.9, 2289.9]}, gsd_m: 20, pixel_m: 20,
+     mtf_along: *mtfc, mtf_across: *mtfc, snr: [{snr: 100, radiance: 1.5}],
+     saturation_radiance: 24.5, e0: 85.25}

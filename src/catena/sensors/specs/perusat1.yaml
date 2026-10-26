@@ -1,0 +1,40 @@
+# PeruSat-1 multispectral, as delivered in CloudPeru2.
+#
+# CloudPeru2 chips are orthorectified and atmospherically corrected (surface reflectance),
+# while the model works in top-of-atmosphere reflectance: worth remembering when comparing.
+# MTF, SNR and saturation are not public; step A5 estimates them from the images.
+id: perusat1
+name: PeruSat-1
+platform: PeruSat-1 (Airbus AstroBus-S, NAOMI-class imager)
+
+sources:
+  charter: "International Charter Space and Major Disasters, PeruSat-1 mission page: bands, 702.5 km, 12-bit, SEN/ORT products. https://docs.disasterscharter.org/missions/opt/perusat-1/"
+  eoportal: "eoPortal, PeruSat-1: pushbroom, TDI on pan, 12-bit digitisation with 10 useful bits, 695 km. https://eoportal.org/satellite-missions/perusat-1"
+  morales2018: "Morales, Huaman & Telles 2018, ICANN: CloudPeru; bands; 2.8 m multispectral"
+  morales2019: "Morales, Ramirez & Telles 2019, arXiv:1904.12743: CloudPeru2, 2.8 m, 512 x 512 chips, atmospherically corrected"
+
+instrument:
+  imaging: pushbroom
+  adc_bits: {value: 12, kind: nominal, source: eoportal, note: "rounded to 10 useful bits"}
+  altitude_km: {value: 695, kind: nominal, source: eoportal, note: "702.5 km on the Charter page"}
+
+product:
+  level: ORT
+  units: surface_reflectance
+  dtype: uint8
+  bits: 8
+  note: "CloudPeru2: orthorectified, atmospherically corrected, stored as 8-bit values 0-252
+    (peru_check, 26 Oct); the scale to reflectance is not documented"
+
+processing: null
+
+defaults:
+  spectral: {kind: nominal, source: charter}
+  gsd_m: {value: 2.8, kind: nominal, source: morales2019}
+  pixel_m: {value: 2.8, kind: nominal, source: morales2019}
+
+bands:
+  - {name: blue, common_name: blue, spectral: {range: [450, 520], note: "450-500 nm in morales2018"}}
+  - {name: green, common_name: green, spectral: {range: [530, 590]}}
+  - {name: red, common_name: red, spectral: {range: [630, 700]}}
+  - {name: nir, common_name: nir, spectral: {range: [752, 885]}}

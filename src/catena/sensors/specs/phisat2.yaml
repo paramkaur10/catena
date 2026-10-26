@@ -1,0 +1,65 @@
+# Phi-sat-2 (ESA, Open Cosmos), Simera Sense MultiScape-class camera, 7 bands + pan.
+#
+# The band set matches Sentinel-2's B02-B08 and HEO's (same camera maker), at 4.75 m.
+# Pan: Open Cosmos lists 550-750 nm but also centre 625 nm / width 250 nm, which means
+# 500-750 nm; HEO's pan, from the same maker, measures 499-746 nm, so 500-750 is used.
+# MTF, SNR and saturation are not yet known.
+#
+# The products we have (phisat2_l1) are named PHISAT-2_L1_<session>_<start>_<stop>_<id>.zip,
+# with times in UTC. bands/scene_0_BC_multiband.tiff holds the 8 bands, Band_0 (pan) to
+# Band_7 (NIR), as uint16 on a 4096 x 4096 grid in longitude and latitude (EPSG:4326).
+# "BC" is the processor's step after denoising and band co-registration and before its
+# radiance-to-reflectance step (Rad2RefTOA in processing_config.json). The values look like
+# top-of-atmosphere radiance in W m-2 sr-1 um-1, in steps of 1: to confirm with the provider.
+# The detector rows put the bands in HEO's stripe order, read over about 0.9 s. In the first
+# two products, pan, blue, green and red top out at about 182, 253, 393 and 271.
+# E0 is assumed equal to Sentinel-2A's for the band with the same centre and width, and to
+# HEO's for pan, until Phi-sat-2's own values are known.
+id: phisat2
+name: Phi-sat-2
+platform: Phi-sat-2 (ESA, Open Cosmos 6U)
+
+sources:
+  opencosmos: "Open Cosmos, PHISAT2 data specification: bands, 4.75 m, 19 km (4096 px), 8 or 12 bit. https://app.open-cosmos.com/help/data-catalog/products/phisat2"
+  esa_wgiss61: "ESA, Phi-sat-2 presentation at CEOS WGISS-61: 510 km SSO, on-board L1 chain including denoising"
+  argotec_srf: "Argotec HEO payload sheet: HEO's pan band (same camera maker) spans 499-746 nm"
+  phisat2_l1: "Phi-sat-2 L1 products of 7 sessions, 19 Aug to 25 Oct 2026: session metadata, processing_config.json, AOCS.json and the BC band files"
+  s2_e0: "Sentinel-2A solar irradiance per band, as in sentinel2_msi.yaml (dea_s2a there)"
+  heo_l1c: "HEO L1C product metadata: solar irradiance 1639 for HEO's 499-746 nm pan band"
+
+instrument:
+  imaging: pushbroom  # snapshot and line-scan modes exist
+  altitude_km: {value: 510, kind: nominal, source: esa_wgiss61}
+
+product:
+  level: L1 BC
+  units: radiance
+  dtype: uint16
+  scale: 1.0
+  offset: 0.0
+  nodata: 0
+  note: "Units and scale inferred from the values on 26 Oct 2026 (phisat2_l1); to confirm"
+
+processing:
+  - {op: denoise, method: unknown, kind: measured, source: phisat2_l1,
+     note: "Denoising = true in processing_config.json; part of the L1 chain (esa_wgiss61)"}
+  - {op: coregister, method: unknown, kind: measured, source: phisat2_l1,
+     note: "BandCoregistration = 2 in processing_config.json"}
+
+defaults:
+  spectral: {kind: nominal, source: opencosmos}
+  gsd_m: {value: 4.75, kind: nominal, source: opencosmos}
+  pixel_m: {value: 4.75, kind: nominal, source: opencosmos}
+  e0: {kind: assumed, source: s2_e0}
+
+bands:
+  - {name: Band_0, common_name: pan, spectral: {range: [500, 750], kind: derived, source: argotec_srf,
+     note: "listed as 550-750 nm, but centre 625 / width 250 means 500-750"},
+     e0: {value: 1639, kind: assumed, source: heo_l1c}}
+  - {name: Band_1, common_name: blue, spectral: {range: [457.5, 522.5]}, e0: 1959.66}
+  - {name: Band_2, common_name: green, spectral: {range: [542.5, 577.5]}, e0: 1823.24}
+  - {name: Band_3, common_name: red, spectral: {range: [650, 680]}, e0: 1512.06}
+  - {name: Band_4, common_name: rededge1, spectral: {range: [697.5, 712.5]}, e0: 1424.64}
+  - {name: Band_5, common_name: rededge2, spectral: {range: [732.5, 747.5]}, e0: 1287.61}
+  - {name: Band_6, common_name: rededge3, spectral: {range: [773, 793]}, e0: 1162.08}
+  - {name: Band_7, common_name: nir, spectral: {range: [784.5, 899.5]}, e0: 1041.63}

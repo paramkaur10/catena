@@ -1,0 +1,62 @@
+# Landsat 8 OLI, Level-1 (Biome and SPARCS are pre-collection L1T products).
+#
+# SNR: measured on orbit at the typical radiance Ltyp; LSat is the approximate saturation
+# radiance. TIRS (bands 10-11) is left out: version 1 of the model uses reflective bands.
+# No MTF numbers are published in the sources read (only "meets requirements"), so MTF is
+# left for step A5 to estimate. USGS publishes no band solar irradiance for OLI; it can be
+# derived from any MTL file as pi * d^2 * RADIANCE_MAXIMUM / REFLECTANCE_MAXIMUM.
+id: landsat8_oli
+name: Landsat 8 OLI
+platform: Landsat 8
+
+sources:
+  usgs_l8: "USGS, Landsat 8 band designations. https://www.usgs.gov/landsat/landsat-8"
+  morfitt2015: "Morfitt et al. 2015, Remote Sensing 7(2):2208, Tables 1, 4, 5: Ltyp, on-orbit SNR, LSat; 14-bit acquisition, 12 bits sent. https://www.mdpi.com/2072-4292/7/2/2208"
+  knight2014: "Knight & Kvaran 2014, Remote Sensing 6(11):10286: co-registration 'well below a quarter pixel'. https://www.mdpi.com/2072-4292/6/11/10286"
+  usgs_l1: "USGS, Using the USGS Landsat Level-1 data product: reflectance rescaling and sun-elevation correction. https://www.usgs.gov/landsat-missions/using-usgs-landsat-level-1-data-product"
+
+instrument:
+  imaging: pushbroom
+  adc_bits: {value: 14, kind: nominal, source: morfitt2015, note: "12 bits are sent to the ground"}
+  altitude_km: {value: 705, kind: nominal, source: usgs_l8}
+
+product:
+  level: L1
+  units: toa_reflectance
+  dtype: uint16
+  scale: per_scene   # REFLECTANCE_MULT_BAND_x in the MTL file
+  offset: per_scene  # REFLECTANCE_ADD_BAND_x; then divide by sin(sun elevation) (usgs_l1)
+  nodata: 0
+
+processing: null
+
+defaults:
+  spectral: {kind: nominal, source: usgs_l8}
+  gsd_m: {value: 30, kind: nominal, source: usgs_l8}
+  pixel_m: {value: 30, kind: nominal, source: usgs_l8}
+  mtf_along: {value: null, note: "edge response 'meets requirements'; no value published"}
+  mtf_across: {value: null, note: "edge response 'meets requirements'; no value published"}
+  snr: {kind: measured, source: morfitt2015}
+  saturation_radiance: {kind: nominal, source: morfitt2015}
+  registration_sigma_px: {range: [null, 0.25], kind: measured, source: knight2014,
+                          note: "'well below a quarter pixel'; statistic not stated"}
+
+bands:
+  - {name: B1, common_name: coastal, spectral: {range: [435, 451]},
+     snr: [{snr: 237, radiance: 40}], saturation_radiance: 950}
+  - {name: B2, common_name: blue, spectral: {range: [452, 512]},
+     snr: [{snr: 367, radiance: 40}], saturation_radiance: 800}
+  - {name: B3, common_name: green, spectral: {range: [533, 590]},
+     snr: [{snr: 304, radiance: 30}], saturation_radiance: 760}
+  - {name: B4, common_name: red, spectral: {range: [636, 673]},
+     snr: [{snr: 227, radiance: 22}], saturation_radiance: 740}
+  - {name: B5, common_name: nir, spectral: {range: [851, 879]},
+     snr: [{snr: 201, radiance: 14}], saturation_radiance: 500}
+  - {name: B6, common_name: swir1, spectral: {range: [1566, 1651]},
+     snr: [{snr: 267, radiance: 4.0}], saturation_radiance: 96}
+  - {name: B7, common_name: swir2, spectral: {range: [2107, 2294]},
+     snr: [{snr: 327, radiance: 1.7}], saturation_radiance: 29}
+  - {name: B8, common_name: pan, spectral: {range: [503, 676]}, gsd_m: 15, pixel_m: 15,
+     snr: [{snr: 148, radiance: 23}], saturation_radiance: 750}
+  - {name: B9, common_name: cirrus, spectral: {range: [1363, 1384]},
+     snr: [{snr: 160, radiance: 6.0}], saturation_radiance: 180}

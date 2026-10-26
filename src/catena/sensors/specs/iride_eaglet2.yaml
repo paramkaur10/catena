@@ -1,0 +1,64 @@
+# IRIDE Eaglet II (OHB Italia), Level-1C top-of-atmosphere reflectance, 3 bands.
+#
+# A colour (Bayer) CMOS used in TDI with 15 stages, demosaicked with Malvar-He-Cutler, then
+# sharpened with an unsharp mask at L1A, after radiometric correction and demosaicking
+# (ohb_2026). The bands are broad and overlap: "red" spans about 665-835 nm, into the near
+# infrared. The optics are soft (MTF > 4-5 % at Nyquist before sharpening) and the
+# sharpening (amount 2.5) multiplies the high-frequency contrast and noise by up to ~3.5, so
+# the SNR seen in L1C is lower than the "> 100 at nadir, sun zenith <= 30 deg" quoted for
+# the instrument (no radiance level given, so it is not stored as a number).
+# Each product's XML has its own gain and offset per band, so the top differs per product:
+# across the 22 products of October 2026, red 0.56-1.26, green 0.56-1.09, blue 0.64-1.69, and
+# two IME02 products clip bright cloud at about 0.56-0.6 (26 Oct). Still open: U (0.9675 in
+# the sample, so not Argotec's d^2 / cos(sun zenith)).
+id: iride_eaglet2
+name: IRIDE Eaglet II
+platform: IRIDE Eaglet II (OHB Italia, OHB-I M3 nanosatellite)
+
+sources:
+  ohb_poster: "Battilana et al. 2023, OHB-I nanosatellite constellation for Earth observation (poster SSC23-P3-02): TDI multispectral, GSD 1.96 m at 525 km, swath 18 km"
+  ohb_2026: "OHB answers to the Eaglet II questionnaire, via E. Cadau, 22 Oct 2026"
+  eaglet_stac: "Eaglet II L1C STAC item IME03_1CSP__RGB3_20261019T160108: band centres and widths, scale and offset, 2.588 m grid"
+  eaglet_l1c: "Eaglet II L1C metadata IME03_1CSP__RGB3_20261019T160108: solar irradiance, TDI Forward, bilinear orthorectification on the ellipsoid, native GSD 2.11 x 3.52 m at 31.9 deg off nadir"
+  eaglet_l1a_cfg: "Eaglet II L1A configuration IME03_AXE1A: sharpening active, radius 2, amount 2.5"
+
+instrument:
+  imaging: pushbroom  # TDI
+  detector: RGB colour (Bayer-type) CMOS
+  tdi_stages_max: {value: 15, kind: nominal, source: ohb_2026}
+  altitude_km: {value: 525, kind: nominal, source: ohb_poster}
+
+product:
+  level: L1C
+  units: toa_reflectance
+  dtype: uint16
+  bits: 16
+  scale: per_scene   # per band, the XML's GAIN; 1.92e-5 for red in the sample
+  offset: per_scene  # per band, the XML's OFFSET; -0.0008 for red in the sample
+  note: "Reflectance is not clipped at 1.0; the sample has values above 1 and a few below 0."
+
+processing:
+  - {op: demosaic, method: malvar_he_cutler, stage: L1A, kind: measured, source: ohb_2026}
+  - {op: sharpen, method: unsharp_mask, radius_px: 2, amount: 2.5, stage: L1A, kind: measured,
+     source: eaglet_l1a_cfg, note: "after radiometric correction and after demosaicking (ohb_2026)"}
+  - {op: resample, kernel: bilinear, stage: L1C, kind: measured, source: eaglet_l1c,
+     note: "orthorectified on the ellipsoid, without a DEM"}
+
+defaults:
+  spectral: {kind: nominal, source: eaglet_stac}
+  gsd_m: {value: 1.96, kind: nominal, source: ohb_poster,
+          note: "at nadir from 525 km; 2.11 x 3.52 m in the 31.9 deg off-nadir sample"}
+  pixel_m: {value: 2.588, kind: measured, source: eaglet_stac,
+            note: "one sample product; the spacing differs per scene"}
+  mtf_along: {range: [0.04, null], kind: nominal, source: ohb_2026,
+              note: "> 4-5 % at Nyquist, before sharpening"}
+  mtf_across: {range: [0.04, null], kind: nominal, source: ohb_2026,
+               note: "> 4-5 % at Nyquist, before sharpening"}
+  saturation_radiance: {value: null, note: "OHB: to be checked"}
+  e0: {kind: derived, source: eaglet_l1c}
+
+bands:
+  - {name: Band 1, common_name: red, spectral: {range: [665, 835],
+     note: "centre 750 nm, FWHM 170 nm; OHB has no measured curves beyond a figure"}, e0: 1288.345}
+  - {name: Band 2, common_name: green, spectral: {range: [487.5, 612.5]}, e0: 1849.541}
+  - {name: Band 3, common_name: blue, spectral: {range: [385, 515]}, e0: 1917.881}

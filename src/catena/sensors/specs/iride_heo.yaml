@@ -1,0 +1,83 @@
+# IRIDE HEO (Argotec HAWK for Earth Observation), Level-1C top-of-atmosphere reflectance.
+#
+# Spectral edges are the FWHM of what the detector records (filter x optics x QE) from
+# Argotec's payload sheet. Band timing is the start time of each band in one L1C product:
+# the order is the order of the filter stripes on the detector (red edge 3 first, blue last).
+# Argotec answered on 22 Oct 2026 (argotec_2026): red edges resampled to 5 m on the ground,
+# no sharpening or denoising, MTF > 10 % at Nyquist in flight, DN 4095 = detector saturation
+# and reflectance above 1. SNR "> 80 for all bands at reflectance 0.75" is stored only in
+# this note: a lower bound at a bright level, with no sun angle, so no noise model yet.
+# U in the XML is d^2 / cos(sun zenith) by Argotec's definition (23 Oct), yet it sits 3.7-4.4 %
+# below that in both products checked, so HEO reflectance may be about 4 % low; ask Argotec.
+# Band timing varies per product (0.56-0.60 s spread): read each band's START_TIME per scene.
+# From our products (26 Oct): the pan band appears to clip in cloud at reflectance 0.39-0.57,
+# and the three March 2026 products of processing version A02 have red edges 1 and 3 at about
+# 0.3 of red edge 2 (kept as a stress test, not for training).
+id: iride_heo
+name: IRIDE HEO
+platform: IRIDE HEO (Argotec HAWK microsatellite)
+
+sources:
+  molteni2025: "Molteni et al. 2025, Proc. SPIE 13546, 135460Q: CMV12000 CMOS, 5.5 um pixels, 8 filter stripes of 200 rows, digital TDI up to 8, GSD 2.66 m at 560 km. https://doi.org/10.1117/12.3061315"
+  argotec_srf: "Argotec HEO payload sheet (Oct 2026): filter, optics and QE curves, 400-1000 nm; copy in data/srf/iride_heo_argotec.csv"
+  heo_l1c: "HEO L1C product IMH08_1CST__OPT8_20260815T122827 (STAC JSON and XML metadata)"
+  param: "Param, IRIDE team: product knowledge, 21 Oct 2026"
+  argotec_2026: "Argotec answers to the HEO questionnaire, via E. Cadau, 22 Oct 2026"
+
+instrument:
+  imaging: pushbroom  # line scan through filter stripes on a 2-D CMOS, with digital TDI
+  detector: AMS CMV12000 CMOS
+  adc_bits: {value: 12, kind: nominal, source: param}
+  tdi_stages_max: {value: 8, kind: nominal, source: molteni2025}
+  pixel_pitch_um: {value: 5.5, kind: nominal, source: molteni2025}
+  altitude_km: {value: 560, kind: nominal, source: molteni2025}
+  focal_length_m: {value: 1.158, kind: derived, source: molteni2025,
+                   note: "5.5 um x 560 km / 2.66 m"}
+
+product:
+  level: L1C
+  units: toa_reflectance
+  dtype: uint16
+  bits: 12
+  scale: 0.0002442598924972117  # 1 / 4094 (QUANTIFICATION_VALUE), as in the STAC item
+  offset: 0.0
+  nodata: 0
+  saturation_code: 4095  # detector saturation and reflectance above 1 (argotec_2026)
+  max_reflectance: 1.0  # DN 4094: the product cannot store reflectance above 1
+
+processing:  # no sharpening or denoising at L1A, L1B or L1C (argotec_2026)
+  - {op: resample, kernel: unknown, bands: [B04, B05, B06], stage: ground, kind: measured,
+     source: argotec_2026, note: "red edges resampled on the ground to 5 m, not binned"}
+  - {op: coregister, method: mutual_information, kind: measured, source: heo_l1c}
+  - {op: resample, kernel: cubic, stage: L1C, kind: measured, source: heo_l1c}
+
+defaults:
+  spectral: {kind: measured, source: argotec_srf}
+  gsd_m: {value: 2.66, kind: nominal, source: molteni2025}
+  pixel_m: {value: 2.5, kind: measured, source: heo_l1c}
+  mtf_along: {range: [0.10, null], kind: measured, source: argotec_2026,
+              note: "> 10 % at Nyquist, measured in flight"}
+  mtf_across: {range: [0.10, null], kind: measured, source: argotec_2026,
+               note: "> 10 % at Nyquist, measured in flight"}
+  saturation_radiance: {value: null, note: "asked Argotec, 21 Oct 2026"}
+  registration_sigma_px: {value: null, note: "co-registered by mutual information; residual asked"}
+  e0: {kind: derived, source: heo_l1c}
+  time_offset_s: {kind: measured, source: heo_l1c}
+
+bands:
+  - {name: B00, common_name: pan, spectral: {range: [499.3, 746.3]},
+     e0: 1639, time_offset_s: 0.3443, srf: "iride_heo_argotec.csv:system_0"}
+  - {name: B01, common_name: blue, spectral: {range: [450.6, 514.9]},
+     e0: 2081, time_offset_s: 0.5986, srf: "iride_heo_argotec.csv:system_1"}
+  - {name: B02, common_name: green, spectral: {range: [544.7, 580.1]},
+     e0: 1815, time_offset_s: 0.5277, srf: "iride_heo_argotec.csv:system_2"}
+  - {name: B03, common_name: red, spectral: {range: [649.0, 680.7]},
+     e0: 1555, time_offset_s: 0.4504, srf: "iride_heo_argotec.csv:system_3"}
+  - {name: B04, common_name: rededge1, spectral: {range: [697.6, 712.2]}, pixel_m: 5.0,
+     e0: 1424, time_offset_s: 0.1847, srf: "iride_heo_argotec.csv:system_4"}
+  - {name: B05, common_name: rededge2, spectral: {range: [732.2, 746.7]}, pixel_m: 5.0,
+     e0: 1286, time_offset_s: 0.0923, srf: "iride_heo_argotec.csv:system_5"}
+  - {name: B06, common_name: rededge3, spectral: {range: [772.4, 792.1]}, pixel_m: 5.0,
+     e0: 1181, time_offset_s: 0.0, srf: "iride_heo_argotec.csv:system_6"}
+  - {name: B07, common_name: nir, spectral: {range: [790.0, 891.5]},
+     e0: 1027, time_offset_s: 0.2770, srf: "iride_heo_argotec.csv:system_7"}

@@ -1,0 +1,55 @@
+# Template for a new sensor. Copy to <sensor_id>.yaml (no leading underscore) and fill in.
+#
+# Any number can be bare (12) or carry provenance:
+#     {value: 12, kind: measured, source: some_key, note: "free text"}
+# kind: measured | nominal | requirement | derived | assumed | estimated
+# source: a key of the `sources` table below. A range: {range: [low, high]} (null = open side).
+# Unknown values: leave them out or write null; never invent a number.
+id: new_sensor
+name: New sensor
+platform: ""
+
+sources:
+  datasheet: "Who published it, what, and a link"
+
+instrument:
+  imaging: pushbroom        # pushbroom | whiskbroom | frame | unknown
+  detector: ""              # e.g. AMS CMV12000 CMOS
+  adc_bits: null
+  tdi_stages_max: null
+  pixel_pitch_um: null
+  focal_length_m: null
+  aperture_m: null
+  altitude_km: null
+
+product:
+  level: L1C
+  units: toa_reflectance    # toa_reflectance | surface_reflectance | radiance | dn
+  dtype: uint16
+  scale: null               # number, or per_scene if the metadata gives it per product
+  offset: null
+  nodata: null
+  saturation_code: null
+  max_reflectance: null
+
+# Ordered processing chain, or null if unknown. Ops: bin, sharpen, denoise, coregister,
+# resample, compress, pansharpen. Add `bands: [...]` when a step touches only some bands.
+processing: null
+
+# Anything shared by all bands (bands override it; mappings are merged).
+defaults:
+  spectral: {kind: nominal, source: datasheet}
+
+bands:
+  - name: B1                 # the band's name in the product files
+    common_name: blue
+    spectral: {range: [450, 520]}     # FWHM edges, nm
+    gsd_m: null                       # native ground sampling distance at nadir, m
+    pixel_m: null                     # pixel spacing of the delivered product, m
+    mtf_along: null                   # system MTF at Nyquist, along track
+    mtf_across: null
+    snr: null                         # [{snr: 120, radiance: 80}] radiance in W m-2 sr-1 um-1
+    saturation_radiance: null         # W m-2 sr-1 um-1
+    e0: null                          # band solar irradiance, W m-2 um-1
+    registration_sigma_px: null       # 1-sigma misalignment to the other bands
+    time_offset_s: null               # acquisition time after the first band
