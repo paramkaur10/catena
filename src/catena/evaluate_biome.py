@@ -1,7 +1,8 @@
 """Test B of the pilot: both arms of every seed on real Landsat 8 scenes (Biome), a camera
-neither arm ever saw, the told arm also with part of its descriptor hidden.
+neither arm ever saw, the told arm also with part of its descriptor hidden or changed.
 
     python -m catena.evaluate_biome RUNS BIOME [--sizes 80 16] [--table pilot]
+        [--variants honest "no noise" hidden] [--out CSV]
 
 RUNS holds one folder per seed with config.json and final.pt (scripts/pilot.sh); BIOME is
 the folder scripts/biome_convert.py made (pilot.csv, index.csv, one folder per scene).
@@ -9,26 +10,33 @@ the folder scripts/biome_convert.py made (pilot.csv, index.csv, one folder per s
 Each scene is cut into square tiles of each size, in 30 m pixels: 80 (2.4 km) is what the
 networks trained on, 16 (480 m) is a small tile. Rows and columns that do not fill a tile are
 left out, and so are tiles without a labelled pixel. Both arms of every seed predict every
-tile, the told arm under each of VARIANTS:
+tile, the told arm under each variant asked for (VARIANTS unless --variants; honest always):
   honest     Landsat 8's chain (catena.data.biome): band edges, 30 m, noise, step and
              saturation; the blur is not published, so it stays unknown
   no noise   the same with the noise unknown
   hidden     band edges, pixel size and top of atmosphere only
+  no step    honest with the step unknown
+  no top     honest with the saturation unknown
+  fine step  honest with the step told as 0.0001, as every real Sentinel-2 image was in
+             training. Landsat 8's honest step, one level of the 12 bits OLI sends down
+             (0.0003 to 0.0009 in the pilot scenes), came in training only with
+             simulated cameras.
 The blind arm gets the band edges only.
 
 Scores pool the pixels of the scenes. Cloud (thin or thick) against not cloud, and the F1 of
 thin and of thick cloud, use every scene; the mean F1 of the four classes uses only the
 scenes whose shadows were labelled, since elsewhere clear may hide shadow. Writes
-RUNS/test_b.csv (one row per seed, arm, variant, scene and size, with the 4 x 4 confusion
-matrix: rows label, columns prediction; clear, thin, thick, shadow) and prints the scores
-per variant, then told minus blind per biome, for cloud BA and for thin cloud, with one sign
-per seed: + told better, - told worse.
+RUNS/test_b.csv, or --out (one row per seed, arm, variant, scene and size, with the 4 x 4
+confusion matrix: rows label, columns prediction; clear, thin, thick, shadow) and prints the
+scores per variant, then told (honest) minus blind per biome, for cloud BA and for thin
+cloud, with one sign per seed: + told better, - told worse.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import math
 import time
 from pathlib import Path
 
@@ -40,13 +48,22 @@ from catena import train as T
 from catena.data import biome
 from catena.evaluate import load_arms
 
-VARIANTS = ("honest", "no noise", "hidden")
-HIDE = {"honest": (), "no noise": ("noise",), "hidden": tuple(desc.CHAIN)}
+VARIANTS = ("honest", "no noise", "hidden")  # Test B as it was first run
+HIDE = {
+    "honest": (),
+    "no noise": ("noise",),
+    "hidden": tuple(desc.CHAIN),
+    "no step": ("step",),
+    "no top": ("top",),
+    "fine step": (),
+}
+FINE_STEP = math.log10(desc.S2_STEP) + 4  # the step code descriptor.describe gives 0.0001
 PIXELS_PER_BATCH = 409_600  # 64 tiles of 80 x 80
 
 
 def told_variant(d: torch.Tensor, name: str) -> torch.Tensor:
-    """The told arm's descriptors (..., bands, 14) with some chain groups made unknown."""
+    """The told arm's descriptors (..., bands, 14) under a variant: some chain groups made
+    unknown, or the step told as Sentinel-2's."""
     if name not in HIDE:
         raise ValueError(f"unknown variant: {name}")
     d = d.clone()
@@ -54,6 +71,10 @@ def told_variant(d: torch.Tensor, name: str) -> torch.Tensor:
         cols, flag = desc.CHAIN[group]
         d[..., cols] = 0.0
         d[..., flag] = 0.0
+    if name == "fine step":
+        cols, flag = desc.CHAIN["step"]
+        d[..., cols] = FINE_STEP
+        d[..., flag] = 1.0
     return d
 
 
@@ -77,11 +98,11 @@ def tiles(dn: np.ndarray, label: np.ndarray, size: int) -> tuple[np.ndarray, np.
 
 
 @torch.no_grad()
-def score_scene(runs, scene, dn, label, d, size, device, amp) -> dict:
+def score_scene(runs, scene, dn, label, d, size, device, amp, variants=VARIANTS) -> dict:
     """Confusion matrices {(seed, arm, variant): 4 x 4} of one scene's tiles of one size."""
     x_all, y_all = tiles(dn, label, size)
     told = torch.from_numpy(d).to(device)
-    shown = {("told", v): told_variant(told, v) for v in VARIANTS}
+    shown = {("told", v): told_variant(told, v) for v in variants}
     shown[("blind", "honest")] = torch.from_numpy(desc.blind(d)).to(device)
     conf = {
         (seed, arm, variant): torch.zeros(4, 4, dtype=torch.long, device=device)
@@ -109,12 +130,18 @@ def pooled(conf: dict, seeds: list[str], arm: str, variant: str, names: list[str
     return [T.scores(sum(conf[(s, arm, variant, n, size)] for n in names)) for s in seeds]
 
 
-def summary(conf: dict, seeds: list[str], scenes: list[biome.Scene], sizes: list[int]) -> None:
+def summary(
+    conf: dict,
+    seeds: list[str],
+    scenes: list[biome.Scene],
+    sizes: list[int],
+    variants=VARIANTS,
+) -> None:
     names = [s.name for s in scenes]
     shadowed = [s.name for s in scenes if s.has_shadow]
     print(f"\n1. Scores pooled over the {len(names)} scenes, mean of the seeds (F1 mean: only")
     print(f"   the {len(shadowed)} scenes with shadow labels)")
-    shown = [("told", v) for v in VARIANTS] + [("blind", "honest")]
+    shown = [("told", v) for v in variants] + [("blind", "honest")]
     for size in sizes:
         head = f"   {size} px tiles ({size * 30 / 1000:g} km)"
         print(f"{head:<26}cloud BA   F1 thin  F1 thick   F1 mean")
@@ -150,12 +177,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("biome", type=Path, help="the folder made by scripts/biome_convert.py")
     p.add_argument("--table", default="pilot", help="pilot (24 scenes) or index (all 96)")
     p.add_argument("--sizes", type=int, nargs="+", default=[80, 16], help="30 m pixels")
+    p.add_argument(
+        "--variants",
+        nargs="+",
+        default=list(VARIANTS),
+        choices=list(HIDE),
+        help="what the told arm is shown (honest is always added)",
+    )
     p.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     p.add_argument("--out", type=Path, help="the CSV to write (default RUNS/test_b.csv)")
     args = p.parse_args(argv)
     wrong = [size for size in args.sizes if size <= 0 or size % 8]
     if wrong:
         p.error(f"tile sizes must be multiples of 8: {wrong}")
+    args.variants = list(dict.fromkeys(["honest", *args.variants]))
     return args
 
 
@@ -170,7 +205,7 @@ def main(argv: list[str] | None = None) -> None:
     chosen = biome.scenes(args.biome, args.table)
     print(
         f"{len(runs)} runs ({', '.join(runs)}) on {device}; {len(chosen)} Landsat 8 scenes; "
-        f"tiles of {', '.join(map(str, args.sizes))} px",
+        f"tiles of {', '.join(map(str, args.sizes))} px; told: {', '.join(args.variants)}",
         flush=True,
     )
 
@@ -180,7 +215,7 @@ def main(argv: list[str] | None = None) -> None:
         dn, label = biome.read(scene)
         d = biome.descriptors(scene)
         for size in args.sizes:
-            found = score_scene(runs, scene, dn, label, d, size, device, amp)
+            found = score_scene(runs, scene, dn, label, d, size, device, amp, args.variants)
             for (seed, arm, variant), m in found.items():
                 conf[(seed, arm, variant, scene.name, size)] = m
                 row = {"seed": seed, "arm": arm, "variant": variant, "scene": scene.name}
@@ -197,7 +232,7 @@ def main(argv: list[str] | None = None) -> None:
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    summary(conf, list(runs), chosen, args.sizes)
+    summary(conf, list(runs), chosen, args.sizes, args.variants)
     minutes = (time.perf_counter() - started) / 60
     print(f"\nwrote {out} ({len(rows)} rows) in {minutes:.0f} min", flush=True)
 

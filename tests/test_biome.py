@@ -145,6 +145,18 @@ def test_what_the_told_arm_is_shown():
     assert torch.equal(quiet[:, 8:10], d[:, 8:10]) and (quiet[:, 12:14] == 1).all()
     hidden = B.told_variant(d, "hidden")
     assert torch.equal(hidden[:, :5], d[:, :5]) and (hidden[:, 5:] == 0).all()
+    no_step = B.told_variant(d, "no step")  # columns 8 and 12: the step and its flag
+    assert (no_step[:, [8, 12]] == 0).all()
+    assert torch.equal(no_step[:, [6, 7, 9, 11, 13]], d[:, [6, 7, 9, 11, 13]])
+    no_top = B.told_variant(d, "no top")  # columns 9 and 13: the saturation and its flag
+    assert (no_top[:, [9, 13]] == 0).all()
+    assert torch.equal(no_top[:, [6, 7, 8, 11, 12]], d[:, [6, 7, 8, 11, 12]])
+    fine = B.told_variant(d, "fine step")
+    assert float(d[0, 8]) == pytest.approx(1.0)  # told 0.001
+    assert fine[:, 8].tolist() == pytest.approx([0.0, 0.0], abs=1e-6)  # told 0.0001
+    assert (fine[:, 12] == 1).all()
+    others = [c for c in range(desc.N_FIELDS) if c != 8]
+    assert torch.equal(fine[:, others], d[:, others])
     with pytest.raises(ValueError, match="unknown variant"):
         B.told_variant(d, "blur x2")
 
@@ -174,3 +186,21 @@ def test_b_on_two_scenes(root, tmp_path, capsys):
             assert len(same) == 8 and len(totals) == 1 and totals.pop() > 0
     out = capsys.readouterr().out
     assert "Told minus blind, cloud BA" in out and "Snow/Ice" in out and "all 2 scenes" in out
+
+    # other variants, into another CSV: honest is added, and scores as in the first run
+    other = tmp_path / "fields.csv"
+    args = [str(runs), str(root), "--sizes", "16", "--device", "cpu", "--out", str(other)]
+    B.main([*args, "--variants", "no step", "fine step"])
+    with open(other, newline="") as f:
+        again = list(csv.DictReader(f))
+    shown = {(r["arm"], r["variant"]) for r in again}
+    told = {("told", v) for v in ("honest", "no step", "fine step")}
+    assert shown == told | {("blind", "honest")} and len(again) == 2 * 4 * len(NAMES)
+    assert honest_counts(again, "16") == honest_counts(rows, "16")
+    assert "told fine step" in capsys.readouterr().out
+
+
+def honest_counts(rows: list[dict], size: str) -> dict:
+    """The told arm's honest confusion matrix per seed and scene, for one tile size."""
+    keep = [r for r in rows if (r["arm"], r["variant"], r["size"]) == ("told", "honest", size)]
+    return {(r["seed"], r["scene"]): r["confusion"] for r in keep}
