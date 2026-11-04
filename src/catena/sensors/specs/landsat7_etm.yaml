@@ -1,0 +1,50 @@
+# Landsat 7 ETM+, Level-1G (the L7 Irish validation scenes, June 2000 to December 2001).
+#
+# Every reflective band is digitised in 8 bits (QCAL 1-255) over a radiance range set by the
+# band's gain, high or low, chosen per scene. The MTL file gives LMIN and LMAX for the gain
+# used, so the saturation radiance and the step are read per scene (catena.data.irish), not
+# here. ESUN is from Chander et al. 2009. The sources read give no per-band SNR at a stated
+# radiance and no MTF value, so noise and blur stay unknown. The thermal band (6) is left out:
+# version 1 of the model uses reflective bands.
+id: landsat7_etm
+name: Landsat 7 ETM+
+platform: Landsat 7
+
+sources:
+  usgs_bands: "USGS, What are the band designations for the Landsat satellites? (ETM+). https://www.usgs.gov/faqs/what-are-band-designations-landsat-satellites"
+  chander2009: "Chander, Markham & Helder 2009, Remote Sensing of Environment 113:893-903, Table 11: ETM+ solar exoatmospheric irradiance. https://doi.org/10.1016/j.rse.2009.01.007"
+  usgs_l7: "USGS, Landsat 7 Data Users Handbook: 8-bit quantisation, high and low gain, LMIN and LMAX per gain in the MTL file. https://www.usgs.gov/landsat-missions/landsat-7-data-users-handbook"
+
+instrument:
+  imaging: whiskbroom
+  adc_bits: {value: 8, kind: nominal, source: usgs_l7}
+  altitude_km: {value: 705, kind: nominal, source: usgs_l7}
+
+product:
+  level: L1G
+  units: dn
+  dtype: uint8
+  scale: per_scene   # (LMAX - LMIN) / (QCALMAX - QCALMIN) per band, from the MTL file
+  offset: per_scene  # radiance at QCALMIN is LMIN; reflectance then needs ESUN and the date
+  nodata: 0
+
+processing: null
+
+defaults:
+  spectral: {kind: nominal, source: usgs_bands}
+  gsd_m: {value: 30, kind: nominal, source: usgs_bands}
+  pixel_m: {value: 30, kind: nominal, source: usgs_bands}
+  mtf_along: {value: null, note: "no value in the sources read"}
+  mtf_across: {value: null, note: "no value in the sources read"}
+  saturation_radiance: {value: null, note: "per scene: LMAX of the band's gain, in the MTL file"}
+  e0: {kind: nominal, source: chander2009}
+
+bands:
+  - {name: B1, common_name: blue, spectral: {range: [450, 520]}, e0: 1997}
+  - {name: B2, common_name: green, spectral: {range: [520, 600]}, e0: 1812}
+  - {name: B3, common_name: red, spectral: {range: [630, 690]}, e0: 1533}
+  - {name: B4, common_name: nir, spectral: {range: [770, 900]}, e0: 1039}
+  - {name: B5, common_name: swir1, spectral: {range: [1550, 1750]}, e0: 230.8}
+  - {name: B7, common_name: swir2, spectral: {range: [2090, 2350]}, e0: 84.90}
+  - {name: B8, common_name: pan, spectral: {range: [520, 900]}, gsd_m: 15, pixel_m: 15,
+     e0: 1362}

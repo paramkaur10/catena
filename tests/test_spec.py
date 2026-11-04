@@ -48,6 +48,7 @@ def test_shipped_sensors():
     assert set(S.available()) == {
         "sentinel2_msi",
         "landsat8_oli",
+        "landsat7_etm",
         "perusat1",
         "iride_heo",
         "iride_eaglet2",

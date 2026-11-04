@@ -1,18 +1,24 @@
-"""Test B of the pilot: both arms of every seed on real Landsat 8 scenes (Biome), a camera
-neither arm ever saw, the told arm also with part of its descriptor hidden or changed.
+"""Tests B and C: both arms of every seed on real scenes, the told arm also with part of its
+descriptor hidden or changed. Test B: Landsat 8 (Biome). Test C: Landsat 7 (L7 Irish), a
+satellite no network trains on.
 
-    python -m catena.evaluate_biome RUNS BIOME [--sizes 80 16] [--table pilot]
-        [--variants honest "no noise" hidden] [--out CSV]
+    python -m catena.evaluate_biome RUNS DATA [--source biome] [--sizes 80 16]
+        [--table pilot] [--variants honest "no noise" hidden] [--out CSV]
 
-RUNS holds one folder per seed with config.json and final.pt (scripts/pilot.sh); BIOME is
-the folder scripts/biome_convert.py made (pilot.csv, index.csv, one folder per scene).
+RUNS holds one folder per seed with config.json and final.pt (scripts/pilot.sh). DATA is the
+folder of the scenes, with pilot.csv and index.csv: for --source biome the one
+scripts/biome_convert.py made (catena.data.biome), for --source irish the one
+scripts/irish_fetch.sh unpacked into, indexed by python -m catena.data.irish
+(catena.data.irish). Both have 30 m pixels.
 
 Each scene is cut into square tiles of each size, in 30 m pixels: 80 (2.4 km) is what the
 networks trained on, 16 (480 m) is a small tile. Rows and columns that do not fill a tile are
 left out, and so are tiles without a labelled pixel. Both arms of every seed predict every
 tile, the told arm under each variant asked for (VARIANTS unless --variants; honest always):
-  honest     Landsat 8's chain (catena.data.biome): band edges, 30 m, noise, step and
-             saturation; the blur is not published, so it stays unknown
+  honest     the satellite's chain as its data module tells it: for Landsat 8 band edges,
+             30 m, noise, step and saturation (the blur is not published); for Landsat 7
+             band edges, 30 m, step and saturation from each scene's gains (no noise, no
+             blur published)
   no noise   the same with the noise unknown
   hidden     band edges, pixel size and top of atmosphere only
   no step    honest with the step unknown
@@ -26,10 +32,11 @@ The blind arm gets the band edges only.
 Scores pool the pixels of the scenes. Cloud (thin or thick) against not cloud, and the F1 of
 thin and of thick cloud, use every scene; the mean F1 of the four classes uses only the
 scenes whose shadows were labelled, since elsewhere clear may hide shadow. Writes
-RUNS/test_b.csv, or --out (one row per seed, arm, variant, scene and size, with the 4 x 4
-confusion matrix: rows label, columns prediction; clear, thin, thick, shadow) and prints the
-scores per variant, then told (honest) minus blind per biome, for cloud BA and for thin
-cloud, with one sign per seed: + told better, - told worse.
+RUNS/test_b.csv (Biome) or RUNS/test_c.csv (L7 Irish), or --out (one row per seed, arm,
+variant, scene and size, with the 4 x 4 confusion matrix: rows label, columns prediction;
+clear, thin, thick, shadow) and prints the scores per variant, then told (honest) minus
+blind per biome (per zone for L7 Irish), for cloud BA and for thin cloud, with one sign per
+seed: + told better, - told worse.
 """
 
 from __future__ import annotations
@@ -45,8 +52,14 @@ import torch
 
 from catena import descriptor as desc
 from catena import train as T
-from catena.data import biome
+from catena.data import biome, irish
 from catena.evaluate import load_arms
+
+# --source: the data module, the satellite, the test, and what scenes are grouped by
+SOURCES = {
+    "biome": (biome, "Landsat 8", "test_b", "biome"),
+    "irish": (irish, "Landsat 7", "test_c", "zone"),
+}
 
 VARIANTS = ("honest", "no noise", "hidden")  # Test B as it was first run
 HIDE = {
@@ -98,8 +111,12 @@ def tiles(dn: np.ndarray, label: np.ndarray, size: int) -> tuple[np.ndarray, np.
 
 
 @torch.no_grad()
-def score_scene(runs, scene, dn, label, d, size, device, amp, variants=VARIANTS) -> dict:
-    """Confusion matrices {(seed, arm, variant): 4 x 4} of one scene's tiles of one size."""
+def score_scene(
+    runs, scene, dn, label, d, size, device, amp, variants=VARIANTS, reflectance=None
+) -> dict:
+    """Confusion matrices {(seed, arm, variant): 4 x 4} of one scene's tiles of one size;
+    reflectance turns the scene's DN into reflectance (default: Biome's)."""
+    reflectance = reflectance or biome.reflectance
     x_all, y_all = tiles(dn, label, size)
     told = torch.from_numpy(d).to(device)
     shown = {("told", v): told_variant(told, v) for v in variants}
@@ -111,7 +128,7 @@ def score_scene(runs, scene, dn, label, d, size, device, amp, variants=VARIANTS)
     }
     batch = max(1, PIXELS_PER_BATCH // (size * size))
     for start in range(0, len(y_all), batch):
-        x = torch.from_numpy(biome.reflectance(scene, x_all[start : start + batch])).to(device)
+        x = torch.from_numpy(reflectance(scene, x_all[start : start + batch])).to(device)
         y = torch.from_numpy(y_all[start : start + batch].astype(np.int64)).to(device)
         n = x.shape[0]
         real = torch.ones(n, x.shape[1], dtype=torch.bool, device=device)
@@ -133,9 +150,10 @@ def pooled(conf: dict, seeds: list[str], arm: str, variant: str, names: list[str
 def summary(
     conf: dict,
     seeds: list[str],
-    scenes: list[biome.Scene],
+    scenes: list,
     sizes: list[int],
     variants=VARIANTS,
+    group: str = "biome",
 ) -> None:
     names = [s.name for s in scenes]
     shadowed = [s.name for s in scenes if s.has_shadow]
@@ -158,8 +176,8 @@ def summary(
     groups = [(b, [s.name for s in scenes if s.biome == b]) for b in biomes]
     groups.append((f"all {len(names)} scenes", names))
     for metric, title in (("cloud_ba", "cloud BA"), ("f1_thin", "F1 of thin cloud")):
-        print(f"\n2. Told minus blind, {title}: per biome, mean over the seeds, one sign per seed")
-        print(f"  {'biome':<22}" + "".join(f"{f'{size} px':>15}" for size in sizes))
+        print(f"\n2. Told minus blind, {title}: per {group}, mean of the seeds, one sign per seed")
+        print(f"  {group:<22}" + "".join(f"{f'{size} px':>15}" for size in sizes))
         for name, members in groups:
             cells = []
             for size in sizes:
@@ -174,8 +192,9 @@ def summary(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("runs", type=Path, help="one folder per seed with config.json and final.pt")
-    p.add_argument("biome", type=Path, help="the folder made by scripts/biome_convert.py")
-    p.add_argument("--table", default="pilot", help="pilot (24 scenes) or index (all 96)")
+    p.add_argument("data", type=Path, help="the scenes' folder, with pilot.csv and index.csv")
+    p.add_argument("--source", choices=list(SOURCES), default="biome", help="whose scenes")
+    p.add_argument("--table", default="pilot", help="pilot (a few per group) or index (all)")
     p.add_argument("--sizes", type=int, nargs="+", default=[80, 16], help="30 m pixels")
     p.add_argument(
         "--variants",
@@ -185,7 +204,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="what the told arm is shown (honest is always added)",
     )
     p.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--out", type=Path, help="the CSV to write (default RUNS/test_b.csv)")
+    p.add_argument("--out", type=Path, help="the CSV (default RUNS/test_b.csv or test_c.csv)")
     args = p.parse_args(argv)
     wrong = [size for size in args.sizes if size <= 0 or size % 8]
     if wrong:
@@ -202,9 +221,10 @@ def main(argv: list[str] | None = None) -> None:
     if not folders:
         raise SystemExit(f"no finished runs (*/final.pt) in {args.runs}")
     runs = {folder.name: load_arms(folder, device) for folder in folders}
-    chosen = biome.scenes(args.biome, args.table)
+    data, satellite, test, group = SOURCES[args.source]
+    chosen = data.scenes(args.data, args.table)
     print(
-        f"{len(runs)} runs ({', '.join(runs)}) on {device}; {len(chosen)} Landsat 8 scenes; "
+        f"{len(runs)} runs ({', '.join(runs)}) on {device}; {len(chosen)} {satellite} scenes; "
         f"tiles of {', '.join(map(str, args.sizes))} px; told: {', '.join(args.variants)}",
         flush=True,
     )
@@ -212,10 +232,12 @@ def main(argv: list[str] | None = None) -> None:
     started, conf, rows = time.perf_counter(), {}, []
     for scene in chosen:
         began = time.perf_counter()
-        dn, label = biome.read(scene)
-        d = biome.descriptors(scene)
+        dn, label = data.read(scene)
+        d = data.descriptors(scene)
         for size in args.sizes:
-            found = score_scene(runs, scene, dn, label, d, size, device, amp, args.variants)
+            found = score_scene(
+                runs, scene, dn, label, d, size, device, amp, args.variants, data.reflectance
+            )
             for (seed, arm, variant), m in found.items():
                 conf[(seed, arm, variant, scene.name, size)] = m
                 row = {"seed": seed, "arm": arm, "variant": variant, "scene": scene.name}
@@ -227,12 +249,12 @@ def main(argv: list[str] | None = None) -> None:
             flush=True,
         )
 
-    out = args.out or args.runs / "test_b.csv"
+    out = args.out or args.runs / f"{test}.csv"
     with open(out, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    summary(conf, list(runs), chosen, args.sizes, args.variants)
+    summary(conf, list(runs), chosen, args.sizes, args.variants, group)
     minutes = (time.perf_counter() - started) / 60
     print(f"\nwrote {out} ({len(rows)} rows) in {minutes:.0f} min", flush=True)
 
