@@ -6,6 +6,7 @@
 #     STEPS=20000 bash scripts/pilot.sh           (fewer steps per seed)
 #     OUT=/root/catena_data/runs/pilot2 bash scripts/pilot.sh --p-s2 0.2
 #                                                 (another folder; options for catena.train)
+#     SEEDS="1" bash scripts/pilot.sh             (only some seeds)
 #
 # Each seed writes OUT/seed<N>/ (train.log, config.json, metrics.jsonl, last.pt, final.pt);
 # OUT/pilot.log says when each seed started, with which options, and how it ended. A seed
@@ -15,7 +16,7 @@ CHIPS=${CHIPS:-/root/catena_data/chips/cloudsen12plus}
 OUT=${OUT:-/root/catena_data/runs/pilot}
 STEPS=${STEPS:-30000}
 mkdir -p "$OUT"
-for SEED in 0 1 2; do
+for SEED in ${SEEDS:-0 1 2}; do
     RUN="$OUT/seed$SEED"
     if [ -f "$RUN/final.pt" ]; then
         echo "$(date -u +%FT%TZ) seed $SEED: already done" | tee -a "$OUT/pilot.log"

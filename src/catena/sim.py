@@ -19,7 +19,7 @@ import math
 
 import numpy as np
 
-from catena.descriptor import S2_STEP, describe
+from catena.descriptor import S2_LEVELS, S2_STEP, describe
 from catena.sensors.physics import (
     blur_and_sample,
     digitize,
@@ -95,10 +95,12 @@ def simulate(chip, s2_sigma, s2_ab, edges_nm, q, bands, rng, s2_gsd=None, s2_top
         x = x + rng.standard_normal(x.shape) * np.sqrt(da * np.clip(x, 0, None) + db)
 
         x = digitize(x, 0.0, cam["top"], cam["bits"])
-        step = max(cam["top"] / (2 ** cam["bits"] - 1), S2_STEP)
+        finest = S2_STEP  # nothing made from the chip is finer than the chip
         top = cam["top"]
         if s2_top is not None and s2_top[k] is not None:
             top = min(top, s2_top[k])  # the data cannot go above where S2 itself saturated
+            finest = max(finest, s2_top[k] / S2_LEVELS)  # nor finer than S2's own 12 bits
+        step = max(cam["top"] / (2 ** cam["bits"] - 1), finest)
         gsd = max(grid, s2_gsd[k] if s2_gsd is not None else GRID_M)  # a 60 m band stays 60 m
         out.append(x)
         descs.append(

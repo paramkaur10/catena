@@ -1,20 +1,28 @@
-"""Training of the pilot: the told and the blind arm on the same batches.
+"""Training: the told and the blind arm on the same batches.
 
     python -m catena.train CHIPS OUT [--seed 0] [--steps 30000] [--devices cuda:0 cuda:1]
+        [--biome L8_BIOME] [--no-sim] [--jitter 1]
 
 CHIPS is the CloudSEN12+ folder made by D2 (index.csv and the patches), OUT a new folder
 for this run. Every batch is made once and given to both arms, each on its own device: the
 told arm reads the full descriptor, with descriptor dropout; the blind arm reads only the
-wavelengths, as SEnSeI does. The arms start from the same weights and see the same windows,
-cameras, bands and noise, so they differ only in what they are told.
+wavelengths, as SEnSeI does, and the pixel size on the ground. The arms start from the same
+weights and see the same windows, cameras, bands and noise, so they differ only in what they
+are told about the imaging chain.
 
-One training sample:
+One training sample from Sentinel-2:
   1. a 240 x 240 window at 10 m from the training split, drawn by area (D3 loader);
-  2. a pixel size shared by the whole batch: 10, 30 or 50 m;
+  2. a pixel size shared by the whole batch: 10, 30 or 50 m (always 10 m with --no-sim);
   3. a random subset of 3 to 13 bands, each band's gain jittered by up to 5%;
   4. at 10 m, 60% of the samples stay as Sentinel-2 made them, with Sentinel-2's own
-     descriptor; all others go through a random camera, so 80% are simulated overall;
+     descriptor; all others go through a random camera, so 80% are simulated overall
+     (none with --no-sim);
   5. the label moved onto the camera's grid.
+With --biome, a share of the batches (--landsat-share, half by default) comes from Landsat 8
+instead: an 80 x 80 window at 30 m from a Biome scene outside the --hold-out table, 3 to 8
+of its 8 bands, the same gain jitter, and Landsat 8's own descriptor. Every card follows one
+rule (catena.descriptor): a blur nobody published is unknown, and the step is one level of
+the bits the camera digitises. With --jitter, told's cards are only roughly right.
 Loss: the partial-label cross-entropy with mild class weights. AdamW, a linear warm-up,
 then cosine decay to zero; gradients clipped at 1; bf16 on the GPU.
 
@@ -45,7 +53,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from catena import descriptor as desc
 from catena import sim
-from catena.data import loader
+from catena.data import biome, loader
 from catena.model import CatenaNet, count_parameters
 
 ARMS = ("told", "blind")
@@ -131,7 +139,7 @@ def render(
     image (13, H, W) is Sentinel-2 reflectance at 10 m and label (H, W) its label; keep are
     the indexes of the bands kept; camera has one chain per kept band, or is None for
     Sentinel-2 as delivered (then q must be 1). Returns the image (13, H/q, W/q) as float32
-    with the kept bands first and zeros after, their honest descriptors (13, 14), which
+    with the kept bands first and zeros after, their honest descriptors (13, 15), which
     slots hold a band (13,), and the label on the camera's grid as int64.
     """
     zenith = sun_zenith if np.isfinite(sun_zenith) and sun_zenith < 85 else DEFAULT_ZENITH
@@ -147,7 +155,15 @@ def render(
         x = chip.astype(np.float32)
         d = np.stack(
             [
-                desc.describe(*b.edges_nm, b.gsd_m, sim.GRID_M, b.mtf, ab, desc.S2_STEP, top)
+                desc.describe(
+                    *b.edges_nm,
+                    b.gsd_m,
+                    sim.GRID_M,
+                    b.mtf if b.mtf_known else None,  # an assumed blur is no fact: unknown
+                    ab,
+                    None if top is None else top / desc.S2_LEVELS,  # one level of 12 bits
+                    top,
+                )
                 for b, ab, top in zip(bands, noise, tops, strict=True)
             ]
         )
@@ -175,7 +191,12 @@ def render(
 
 class TrainSamples(Dataset):
     """Training samples for both arms. Sample i depends only on the seed and i, so a run
-    repeats exactly whatever the number of data-loading processes."""
+    repeats exactly whatever the number of data-loading processes.
+
+    All samples of one batch (i // batch) come from one source: Sentinel-2, or Landsat 8 for
+    a share of the batches when landsat windows are given; a Sentinel-2 batch also shares one
+    pixel size. told gets the card with dropout (desc.hide), roughly right when jitter > 0
+    (desc.jitter); blind gets the wavelengths and the pixel size only."""
 
     def __init__(
         self,
@@ -185,33 +206,68 @@ class TrainSamples(Dataset):
         p_s2: float = 0.6,
         gain: float = 0.05,
         min_bands: int = 3,
+        landsat: biome.Windows | None = None,
+        share: float = 0.5,
+        simulate: bool = True,
+        jitter: float = 0.0,
     ) -> None:
         self.windows, self.batch, self.seed = windows, batch, seed
         self.p_s2, self.gain, self.min_bands = p_s2, gain, min_bands
+        self.landsat, self.share = landsat, share
+        self.simulate, self.jitter = simulate, jitter
 
     def __len__(self) -> int:
         return len(self.windows)
 
+    def source(self, i: int) -> str:
+        """Where sample i comes from, "sentinel2" or "landsat8": the same for a whole batch."""
+        if self.landsat is None:
+            return "sentinel2"
+        rng = np.random.default_rng([self.seed, 3, i // self.batch])
+        return "landsat8" if rng.random() < self.share else "sentinel2"
+
     def pixel_size(self, i: int) -> int:
         """The q of sample i: every sample of one batch (i // batch) shares it."""
+        if not self.simulate:
+            return 1
         rng = np.random.default_rng([self.seed, 2, i // self.batch])
         return int(rng.choice(sim.Q_CHOICES))
 
-    def __getitem__(self, i: int) -> dict:
+    def sentinel2(self, i: int, rng: np.random.Generator) -> tuple:
         s = self.windows[i]
         q = self.pixel_size(i)
-        rng = np.random.default_rng([self.seed, 1, i])
         n = int(rng.integers(self.min_bands, N_BANDS + 1))
         keep = np.sort(rng.choice(N_BANDS, n, replace=False))
         gains = rng.uniform(1 - self.gain, 1 + self.gain, n)
         camera = None
-        if q > 1 or rng.random() >= self.p_s2:
+        if self.simulate and (q > 1 or rng.random() >= self.p_s2):
             _, camera = sim.imagine_camera(rng, n, q)
-        x, d, real, label = render(
-            s["image"], s["label"], s["sun_zenith"], q, keep, camera, rng, gains
-        )
+        return render(s["image"], s["label"], s["sun_zenith"], q, keep, camera, rng, gains)
+
+    def landsat8(self, rng: np.random.Generator) -> tuple:
+        scene, dn, label = self.landsat.draw(rng)
+        bands = len(biome.BANDS)
+        n = int(rng.integers(min(self.min_bands, bands), bands + 1))
+        keep = np.sort(rng.choice(bands, n, replace=False))
+        gains = rng.uniform(1 - self.gain, 1 + self.gain, n)
+        size = dn.shape[-1]
+        x = np.zeros((N_BANDS, size, size), np.float32)
+        x[:n] = biome.reflectance(scene, dn)[keep] * gains[:, None, None]
+        d = np.zeros((N_BANDS, desc.N_FIELDS), np.float32)
+        d[:n] = self.landsat.cards[scene.name][keep]
+        real = np.zeros(N_BANDS, bool)
+        real[:n] = True
+        return x, d, real, label.astype(np.int64)
+
+    def __getitem__(self, i: int) -> dict:
+        rng = np.random.default_rng([self.seed, 1, i])
+        if self.source(i) == "landsat8":
+            x, d, real, label = self.landsat8(rng)
+        else:
+            x, d, real, label = self.sentinel2(i, rng)
+        n = int(real.sum())
         told = d.copy()
-        told[:n] = desc.hide(d[:n], rng)
+        told[:n] = desc.jitter(desc.hide(d[:n], rng), rng, self.jitter)
         return {
             "image": x,
             "real": real,
@@ -395,6 +451,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--warmup", type=int, default=1000)
     p.add_argument("--clip", type=float, default=1.0)
     p.add_argument("--p-s2", type=float, default=0.6, help="10 m samples kept as delivered")
+    p.add_argument("--biome", type=Path, help="the Landsat 8 Biome folder: its scenes join in")
+    p.add_argument("--hold-out", default="pilot", help="the Biome table kept out of training")
+    p.add_argument("--landsat-share", type=float, default=0.5, help="batches from Landsat 8")
+    p.add_argument("--landsat-size", type=int, default=80, help="Landsat 8 windows, 30 m px")
+    p.add_argument("--no-sim", action="store_true", help="no simulated cameras at all")
+    p.add_argument("--jitter", type=float, default=0.0, help="told's cards roughly right: 1")
     p.add_argument("--widths", type=int, nargs=4, default=[32, 64, 128, 256])
     p.add_argument("--stem", type=int, default=16)
     p.add_argument("--log-every", type=int, default=100)
@@ -405,6 +467,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = p.parse_args(argv)
     if args.size % 120:
         p.error("--size must be a multiple of 120: divisible by 1, 3 and 5, then by 8")
+    if args.landsat_size <= 0 or args.landsat_size % 8:
+        p.error("--landsat-size must be a multiple of 8")
+    if not 0.0 <= args.landsat_share <= 1.0:
+        p.error("--landsat-share must be between 0 and 1")
     return args
 
 
@@ -439,7 +505,21 @@ def main(argv: list[str] | None = None) -> None:
     windows = loader.TrainingWindows(
         args.chips, "train", size=args.size, length=args.steps * args.batch, seed=args.seed
     )
-    train_data = TrainSamples(windows, args.batch, args.seed, p_s2=args.p_s2)
+    landsat = None
+    if args.biome is not None:
+        held = {s.name for s in biome.scenes(args.biome, args.hold_out)}
+        chosen = [s for s in biome.scenes(args.biome, "index") if s.name not in held]
+        landsat = biome.Windows(chosen, size=args.landsat_size)
+    train_data = TrainSamples(
+        windows,
+        args.batch,
+        args.seed,
+        p_s2=args.p_s2,
+        landsat=landsat,
+        share=args.landsat_share,
+        simulate=not args.no_sim,
+        jitter=args.jitter,
+    )
     val_data = ValSamples(
         loader.GridWindows(args.chips, "validation", size=args.size), args.val_windows
     )
@@ -477,6 +557,7 @@ def main(argv: list[str] | None = None) -> None:
         "bf16": amp,
         "parameters": count_parameters(first),
         "train_patches": len(windows.patches),
+        "landsat_scenes": [s.name for s in landsat.scenes] if landsat else [],
         "validation_windows": len(val_data.picks),
         "validation_cameras": [c[0] for c in VAL_CAMERAS],
         "fields": list(desc.FIELDS),
@@ -487,6 +568,12 @@ def main(argv: list[str] | None = None) -> None:
     print(
         f"{config['parameters']:,} parameters per arm; told on {devices['told']}, blind on "
         f"{devices['blind']}; {len(windows.patches):,} training patches; git {config['git']}",
+        flush=True,
+    )
+    print(
+        f"Landsat 8: {len(landsat) if landsat else 0} scenes"
+        + (f", {args.landsat_share:.0%} of the batches" if landsat else "")
+        + f"; simulated cameras {'off' if args.no_sim else 'on'}; jitter {args.jitter}",
         flush=True,
     )
 

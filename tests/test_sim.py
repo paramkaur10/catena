@@ -29,7 +29,9 @@ def chip(n=3, size=90, value=0.2):
 def test_unknown_fields_stay_zero_with_flag_zero():
     d = describe(*RED, 30, 30)
     for name in FIELDS[4:]:
-        assert field(d, name) == 0.0
+        if name != "gsd":
+            assert field(d, name) == 0.0
+    assert field(d, "gsd") == pytest.approx(math.log2(3))  # the pixel size is always known
     assert field(d, "lo") < field(d, "mid") < field(d, "hi")
 
 
@@ -81,6 +83,15 @@ def test_digitizing_steps_and_top():
     img, desc, _ = simulate(chip(1, value=0.95), [S2_SIGMA], [S2_AB], [RED], 1, cam, rng)
     assert img.max() == pytest.approx(0.8)
     assert 10 ** (field(desc[0], "step") - 4) == pytest.approx(0.8 / 255)
+
+
+def test_never_finer_than_sentinel2s_own_bits():
+    """A 14-bit camera made from a Sentinel-2 band that saturates at 1.0 has only the
+    information of S2's 12 bits: its step is 1.0 / 4095, not 1.2 / 16383."""
+    rng = np.random.default_rng(8)
+    cam = fixed_camera(1, mtf=0.25, snr=300, bits=14, top=1.2)
+    _, desc, _ = simulate(chip(1), [S2_SIGMA], [S2_AB], [RED], 1, cam, rng, s2_top=[1.0])
+    assert 10 ** (field(desc[0], "step") - 4) == pytest.approx(1.0 / 4095, rel=1e-5)
 
 
 def test_the_top_is_where_the_data_stop():

@@ -21,7 +21,8 @@ The cameras (TEST_CAMERAS):
 Window sizes are in 10 m pixels. 240 is what the networks trained on; 48 is a small tile, as
 on board, with little image to read the blur and the noise from.
 
-What the told arm is shown (VARIANTS); the blind arm always gets the wavelengths only:
+What the told arm is shown (VARIANTS); the blind arm always gets the wavelengths and the
+pixel size only:
   honest     the descriptor of what the camera did
   hidden     blur, noise, step and saturation unknown, as descriptor dropout taught it
   noise x3   the noise said 3 times larger than it is; noise /3: 3 times smaller
@@ -81,7 +82,7 @@ TEST_CAMERAS = make_cameras()
 
 
 def told_variant(d: torch.Tensor, name: str) -> torch.Tensor:
-    """The told arm's descriptors (..., bands, 14) under one variant. Values nobody knows, and
+    """The told arm's descriptors (..., bands, 15) under one variant. Values nobody knows, and
     the empty band slots, stay 0."""
     d = d.clone()
     if name == "hidden":
@@ -127,9 +128,10 @@ def load_arms(run: Path, device: torch.device) -> dict:
     """Both arms of one finished run, ready to predict."""
     args = json.loads((run / "config.json").read_text())["args"]
     state = torch.load(run / "final.pt", map_location="cpu")
+    fields = state["models"]["told"]["bands.embed.0.weight"].shape[1]  # 14 in the pilot
     arms = {}
     for arm in T.ARMS:
-        net = CatenaNet(widths=tuple(args["widths"]), stem=args["stem"])
+        net = CatenaNet(widths=tuple(args["widths"]), stem=args["stem"], fields=fields)
         net.load_state_dict(state["models"][arm])
         arms[arm] = net.to(device).eval()
     return arms

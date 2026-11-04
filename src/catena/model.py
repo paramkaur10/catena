@@ -1,7 +1,8 @@
 """Catena's network: a band encoder for any set of bands, and a U-Net tuned by the sensor.
 
 Band encoder:
-  1. each band's 14-number descriptor becomes a vector of 64 (a small MLP);
+  1. each band's descriptor (15 numbers; 14 before the pixel size joined) becomes a vector of
+     64 (a small MLP);
   2. one Transformer layer lets the bands of an image attend to each other (padding masked);
   3. every band image goes through the same two 3x3 convolutions, scaled and shifted per
      channel by its band vector (FiLM);
@@ -14,7 +15,7 @@ and width must be multiples of 8.
 
 FiLM starts at zero (gamma 1, beta 0), so training starts from a plain U-Net. For one fixed
 sensor every FiLM is a constant that fold_block() bakes into the GroupNorm before flight.
-2,185,077 parameters with the default sizes; the budget is 3.75 M.
+2,185,141 parameters with the default sizes; the budget is 3.75 M.
 """
 
 from __future__ import annotations
@@ -59,9 +60,10 @@ class ConvFiLM(nn.Module):
 class BandEncoder(nn.Module):
     """Any number of bands, each with its descriptor -> one feature map and a sensor vector."""
 
-    def __init__(self, width: int = 16):
+    def __init__(self, width: int = 16, fields: int = N_FIELDS):
         super().__init__()
-        self.embed = nn.Sequential(nn.Linear(N_FIELDS, EMB), nn.GELU(), nn.Linear(EMB, EMB))
+        self.fields = fields  # a network trained with fewer fields reads only the first ones
+        self.embed = nn.Sequential(nn.Linear(fields, EMB), nn.GELU(), nn.Linear(EMB, EMB))
         self.mix = nn.TransformerEncoderLayer(
             EMB, nhead=4, dim_feedforward=128, dropout=0.0, batch_first=True
         )  # attention across the bands of one image
@@ -71,9 +73,10 @@ class BandEncoder(nn.Module):
         self.score = nn.Linear(EMB, 1)
 
     def forward(self, x, d, real):
-        """x (B, N, H, W) bands; d (B, N, 14) descriptors; real (B, N) bool, False = padding."""
+        """x (B, N, H, W) bands; d (B, N, fields or more) descriptors; real (B, N) bool, False
+        = padding."""
         b, n, h, w = x.shape
-        e = self.mix(self.embed(d), src_key_padding_mask=~real)  # (B, N, EMB)
+        e = self.mix(self.embed(d[..., : self.fields]), src_key_padding_mask=~real)  # (B, N, EMB)
         e = e.masked_fill(~real[..., None], 0.0)  # padding slots carry nothing
         eb = e.reshape(b * n, EMB)
         f = x.reshape(b * n, 1, h, w)
@@ -87,9 +90,11 @@ class BandEncoder(nn.Module):
 
 
 class CatenaNet(nn.Module):
-    def __init__(self, widths=(32, 64, 128, 256), classes: int = 4, stem: int = 16):
+    def __init__(
+        self, widths=(32, 64, 128, 256), classes: int = 4, stem: int = 16, fields: int = N_FIELDS
+    ):
         super().__init__()
-        self.bands = BandEncoder(stem)
+        self.bands = BandEncoder(stem, fields)
         ins = [2 * stem, *widths[:-1]]
         self.down = nn.ModuleList(
             nn.ModuleList([ConvFiLM(i, o), ConvFiLM(o, o)])

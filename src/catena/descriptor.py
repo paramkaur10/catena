@@ -1,4 +1,4 @@
-"""What the model is told about each band: its imaging chain as 14 numbers (A3).
+"""What the model is told about each band: its imaging chain as 15 numbers (A3).
 
     lo, mid, hi    shortest, central and longest wavelength, as log(nm - 300) - 2
     surface        1 for surface reflectance, 0 for top of atmosphere
@@ -9,10 +9,18 @@
     step           log10(one digital number, in reflectance) + 4
     top            the saturation level in reflectance, capped at 2
     known_psf, known_noise, known_step, known_top    1 when that value is known
+    gsd            log2(grid pixel size / 10 m): 0 at 10 m, 1.58 at 30 m, -2 at 2.5 m
 
 A value nobody knows is 0 with its flag at 0. In training, descriptor dropout (hide) hides
-known values the same way, so the model learns to work with gaps; the blind arm (blind)
-keeps only the three wavelength fields, which is what SEnSeI is told.
+known values the same way, so the model learns to work with gaps, and jitter moves the
+known values by errors the size real specs carry, so the model does not trust them blindly.
+The blind arm (blind) keeps the three wavelength fields, which is what SEnSeI is told, and
+the pixel size on the ground, which every sensor publishes: told and blind differ only in
+the imaging chain.
+
+The step is one level of the bits the camera digitises, over its range up to saturation:
+top / (2^bits - 1). That is the same rule for every camera, simulated or real, whatever
+integers the delivered product stores.
 
 bands_from_spec() reads a sensor spec (A2) into the numbers the simulator and the
 descriptor need. Noise and saturation are specified in radiance; they move to reflectance
@@ -44,10 +52,14 @@ FIELDS = (
     "known_noise",
     "known_step",
     "known_top",
+    "gsd",  # spatial: the grid's pixel size on the ground; always known, told to both arms
 )
 N_FIELDS = len(FIELDS)
 N_SPECTRAL = 3
-S2_STEP = 1e-4  # Sentinel-2 L1C stores reflectance x 10000
+GSD = FIELDS.index("gsd")
+GSD_REF_M = 10.0
+S2_STEP = 1e-4  # Sentinel-2 L1C stores reflectance x 10000: no camera made from it is finer
+S2_LEVELS = 4095  # Sentinel-2 MSI digitises 12 bits
 DARK, BRIGHT = 0.05, 0.5  # the two reflectance levels the noise is told at
 
 # what dropout hides together: the value columns of each group and their flag column
@@ -71,7 +83,7 @@ def describe(
     top: float | None = None,
     surface: bool = False,
 ) -> np.ndarray:
-    """One band's descriptor, 14 numbers. A chain value nobody knows stays 0, flag 0.
+    """One band's descriptor, 15 numbers. A chain value nobody knows stays 0, flag 0.
 
     mtf_nyquist is the MTF at the band's own Nyquist frequency (0.5 cycles per band pixel);
     noise_ab is (a, b) of var = a * rho + b in reflectance units."""
@@ -93,13 +105,14 @@ def describe(
     if top is not None:
         d[9] = min(top, 2.0)
         d[13] = 1.0
+    d[GSD] = math.log2(grid_m / GSD_REF_M)
     return d
 
 
 def hide(
     desc: np.ndarray, rng: np.random.Generator, p_one: float = 0.2, p_all: float = 0.1
 ) -> np.ndarray:
-    """Descriptor dropout on one sample's (bands, 14) descriptors. A hidden value becomes 0
+    """Descriptor dropout on one sample's (bands, 15) descriptors. A hidden value becomes 0
     with its flag 0, exactly how an unknown value looks at test time. A group is hidden for
     every band at once, as real gaps are (nobody tells us HEO's SNR for one band only)."""
     d = desc.copy()
@@ -111,10 +124,38 @@ def hide(
     return d
 
 
-def blind(desc: np.ndarray) -> np.ndarray:
-    """The blind arm's descriptors: the wavelengths, and every other field unknown."""
+def jitter(desc: np.ndarray, rng: np.random.Generator, scale: float = 1.0) -> np.ndarray:
+    """A roughly right card: each known chain value of each band moved by a random error of
+    the size real specs carry. At scale 1: the blur up to x or / 1.25, the noise and the step
+    up to x or / 2 (0.3 in their log10 codes; dark and bright noise move together), the
+    saturation by up to 15%. Unknown values stay 0; scale 0 changes nothing."""
     d = desc.copy()
-    d[..., N_SPECTRAL:] = 0.0
+    if scale <= 0:
+        return d
+    n = len(d)
+    (psf,), psf_flag = CHAIN["psf"]
+    noise, noise_flag = CHAIN["noise"]
+    (step,), step_flag = CHAIN["step"]
+    (top,), top_flag = CHAIN["top"]
+    known = d[:, psf_flag] == 1
+    d[:, psf] = np.where(known, d[:, psf] * 1.25 ** rng.uniform(-scale, scale, n), d[:, psf])
+    known = d[:, noise_flag] == 1
+    shift = rng.uniform(-0.3 * scale, 0.3 * scale, n)
+    for col in noise:
+        d[:, col] = np.where(known, d[:, col] + shift, d[:, col])
+    known = d[:, step_flag] == 1
+    d[:, step] = np.where(known, d[:, step] + rng.uniform(-0.3 * scale, 0.3 * scale, n), d[:, step])
+    known = d[:, top_flag] == 1
+    moved = np.minimum(d[:, top] * (1 + rng.uniform(-0.15 * scale, 0.15 * scale, n)), 2.0)
+    d[:, top] = np.where(known, moved, d[:, top])
+    return d
+
+
+def blind(desc: np.ndarray) -> np.ndarray:
+    """The blind arm's descriptors: the wavelengths and the pixel size on the ground; every
+    other field unknown."""
+    d = desc.copy()
+    d[..., N_SPECTRAL:GSD] = 0.0
     return d
 
 

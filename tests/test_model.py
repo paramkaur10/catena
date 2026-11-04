@@ -1,5 +1,6 @@
-"""The network: output shape and size, indifference to band order and to padding, folding
-FiLM into the GroupNorm without changing the output, and gradients reaching every part."""
+"""The network: output shape and size, indifference to band order and to padding, older
+networks reading the fields they know, folding FiLM into the GroupNorm without changing the
+output, and gradients reaching every part."""
 
 from __future__ import annotations
 
@@ -27,7 +28,7 @@ def inputs(batch=2, bands=5, size=24):
 
 def test_shape_and_size():
     net = CatenaNet().eval()
-    assert count_parameters(net) == 2_185_077  # the budget is 3.75 M
+    assert count_parameters(net) == 2_185_141  # the budget is 3.75 M
     x, d, real = inputs(size=48)
     real[1, 3:] = False  # the second image has 3 bands
     with torch.no_grad():
@@ -45,6 +46,15 @@ def test_band_order_and_padding_change_nothing():
         djunk = torch.cat([d, torch.randn(2, 3, N_FIELDS)], dim=1)
         rjunk = torch.cat([real, torch.zeros(2, 3, dtype=torch.bool)], dim=1)
         assert torch.allclose(net(junk, djunk, rjunk), out, atol=1e-5)
+
+
+def test_a_network_with_fewer_fields_reads_the_first_ones():
+    torch.manual_seed(0)
+    old = CatenaNet(widths=(8, 16, 16, 16), stem=8, fields=N_FIELDS - 1).eval()  # the pilot's
+    assert old.bands.embed[0].weight.shape[1] == N_FIELDS - 1
+    x, d, real = inputs()
+    with torch.no_grad():
+        assert torch.equal(old(x, d, real), old(x, d[..., :-1], real))
 
 
 def test_folding_keeps_the_output():

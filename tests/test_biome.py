@@ -1,5 +1,6 @@
 """Landsat 8 Biome: reading a converted scene, its reflectance, what the model is told about
-it, its tiles, and Test B on two made-up scenes with untrained networks (CPU)."""
+it, its tiles, training windows, and Test B on two made-up scenes with untrained networks
+(CPU)."""
 
 from __future__ import annotations
 
@@ -117,11 +118,12 @@ def test_what_landsat_8_is_told(root):
     assert (d[:, 4] == 0).all()  # 30 m bands on a 30 m grid
     assert (d[:, 5] == 0).all() and (d[:, 10] == 0).all()  # blur not published: unknown
     assert (d[:, 11:14] == 1).all()  # noise, step and saturation known
-    step = (1.2107 + 0.09998) / 4095 / math.sin(math.radians(45))
-    assert d[0, 8] == pytest.approx(math.log10(step) + 4, rel=1e-5)
+    assert d[:, desc.GSD] == pytest.approx(math.log2(3))  # 30 m pixels
     k = 2e-5 / (RADIANCE_MULT * math.sin(math.radians(45)))  # reflectance of 1 W m-2 sr-1 um-1
     assert d[4, 9] == pytest.approx(k * 500, rel=1e-5)  # B5 saturates at 500 W m-2 sr-1 um-1
     assert d[0, 9] == 2.0  # B1's saturation, above 2 here, is capped
+    # the step: one of the 4095 levels OLI digitises up to saturation, B1's uncapped k * 950
+    assert d[0, 8] == pytest.approx(math.log10(k * 950 / 4095) + 4, rel=1e-5)
     # with the sun lower, the same radiance noise is more reflectance noise
     assert (biome.descriptors(low)[:, 6:8] > d[:, 6:8]).all()
 
@@ -136,6 +138,24 @@ def test_tiles_keep_every_labelled_pixel_once(root):
     assert np.array_equal(x[0], dn[:, 0:16, 16:32]) and np.array_equal(y[0], label[0:16, 16:32])
 
 
+def test_training_windows(root):
+    snow, water = biome.scenes(root, "pilot")  # snow has shadow labels, water has not
+    windows = biome.Windows([snow, water], size=16)
+    assert len(windows) == 2 and windows.cards[water.name].shape == (8, desc.N_FIELDS)
+    rng = np.random.default_rng(0)
+    seen = set()
+    for _ in range(40):
+        scene, dn, label = windows.draw(rng)
+        assert dn.shape == (8, 16, 16) and label.shape == (16, 16)
+        assert (label != 255).mean() >= 0.5
+        codes = set(np.unique(label).tolist())
+        assert codes <= ({0, 1, 2, 3, 255} if scene.has_shadow else {1, 2, 5, 255})
+        seen.add(scene.name)
+    assert seen == {snow.name, water.name}
+    with pytest.raises(ValueError, match="smaller"):
+        biome.Windows([snow], size=64)
+
+
 def test_what_the_told_arm_is_shown():
     one = desc.describe(450, 520, 30, 30, None, (1e-4, 1e-6), 1e-3, 1.2)
     d = torch.from_numpy(np.stack([one, one]))
@@ -144,7 +164,8 @@ def test_what_the_told_arm_is_shown():
     assert (quiet[:, 6:8] == 0).all() and (quiet[:, 11] == 0).all()
     assert torch.equal(quiet[:, 8:10], d[:, 8:10]) and (quiet[:, 12:14] == 1).all()
     hidden = B.told_variant(d, "hidden")
-    assert torch.equal(hidden[:, :5], d[:, :5]) and (hidden[:, 5:] == 0).all()
+    assert torch.equal(hidden[:, :5], d[:, :5]) and (hidden[:, 5 : desc.GSD] == 0).all()
+    assert torch.equal(hidden[:, desc.GSD], d[:, desc.GSD])  # the pixel size stays
     no_step = B.told_variant(d, "no step")  # columns 8 and 12: the step and its flag
     assert (no_step[:, [8, 12]] == 0).all()
     assert torch.equal(no_step[:, [6, 7, 9, 11, 13]], d[:, [6, 7, 9, 11, 13]])
