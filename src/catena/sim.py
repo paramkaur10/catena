@@ -34,16 +34,21 @@ SNR_LEVEL = 0.3  # the reflectance at which a camera's SNR is drawn
 
 
 def imagine_camera(
-    rng: np.random.Generator, n_bands: int, q: int | None = None
+    rng: np.random.Generator,
+    n_bands: int,
+    q: int | None = None,
+    tops: tuple[float, float] = (0.6, 1.6),
 ) -> tuple[int, list[dict]]:
     """A random camera: one pixel size (q, drawn unless given), a base chain, and small
-    differences between its bands, as real bands have."""
+    differences between its bands, as real bands have. Its saturation is drawn from `tops`,
+    in reflectance: 0.6-1.6 in the pilot; the big run reaches down to 0.25, where Eaglet II,
+    HEO's pan band and Landsat 7 clip bright cloud."""
     q = int(rng.choice(Q_CHOICES)) if q is None else int(q)
     mtf = rng.uniform(0.05, 0.4)
     snr = math.exp(rng.uniform(math.log(10), math.log(300)))  # at reflectance 0.3
     shot = rng.uniform(0.3, 0.9)
     bits = int(rng.choice([8, 10, 12, 14]))
-    top = rng.uniform(0.6, 1.6)
+    top = rng.uniform(*tops)
     bands = [
         {
             "mtf": float(np.clip(mtf * rng.uniform(0.8, 1.2), 0.03, 0.6)),

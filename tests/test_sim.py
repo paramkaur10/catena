@@ -121,6 +121,8 @@ def test_imagined_cameras_stay_in_range():
             assert 0.03 <= b["mtf"] <= 0.6 and 7 <= b["snr"] <= 390
             assert b["bits"] in (8, 10, 12, 14) and 0.6 <= b["top"] <= 1.6
     assert imagine_camera(rng, 3, q=5)[0] == 5
+    tops = [imagine_camera(rng, 1, tops=(0.25, 1.6))[1][0]["top"] for _ in range(300)]
+    assert 0.25 <= min(tops) < 0.4 and max(tops) <= 1.6  # the big run's range
 
 
 def test_a_20m_band_keeps_its_own_pixel_size():

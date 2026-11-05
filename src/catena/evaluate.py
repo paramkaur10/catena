@@ -55,7 +55,7 @@ from catena import descriptor as desc
 from catena import sim
 from catena import train as T
 from catena.data import loader
-from catena.model import CatenaNet
+from catena.model import Clarity
 
 TEST_SEED = 20261104
 RGBN = ("B02", "B03", "B04", "B08")
@@ -131,7 +131,7 @@ def load_arms(run: Path, device: torch.device) -> dict:
     fields = state["models"]["told"]["bands.embed.0.weight"].shape[1]  # 14 in the pilot
     arms = {}
     for arm in T.ARMS:
-        net = CatenaNet(widths=tuple(args["widths"]), stem=args["stem"], fields=fields)
+        net = Clarity(widths=tuple(args["widths"]), stem=args["stem"], fields=fields)
         net.load_state_dict(state["models"][arm])
         arms[arm] = net.to(device).eval()
     return arms

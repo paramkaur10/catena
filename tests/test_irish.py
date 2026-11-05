@@ -20,7 +20,7 @@ from rasterio.transform import from_origin  # noqa: E402
 from catena import descriptor as desc  # noqa: E402
 from catena import evaluate_biome as B  # noqa: E402
 from catena.data import irish  # noqa: E402
-from catena.model import CatenaNet  # noqa: E402
+from catena.model import Clarity  # noqa: E402
 
 H, W = 40, 48
 LMAX = {  # the handbook's LMAX of B1-B5 and B7, high and low gain, from July 2000
@@ -138,7 +138,7 @@ def tiny_run(folder, seed: int) -> None:
     """A run folder as catena.train leaves one, with untrained networks."""
     torch.manual_seed(seed)
     folder.mkdir(parents=True)
-    nets = {arm: CatenaNet(widths=(8, 8, 8, 8), stem=8) for arm in ("told", "blind")}
+    nets = {arm: Clarity(widths=(8, 8, 8, 8), stem=8) for arm in ("told", "blind")}
     (folder / "config.json").write_text(json.dumps({"args": {"widths": [8] * 4, "stem": 8}}))
     state = {"step": 0, "models": {arm: net.state_dict() for arm, net in nets.items()}}
     torch.save(state, folder / "final.pt")

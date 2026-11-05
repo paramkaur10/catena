@@ -1,5 +1,5 @@
-"""The card's newest parts: the pixel size on the ground, told to both arms, and roughly right
-cards (jitter)."""
+"""The card's newest parts: the pixel size on the ground, told to both arms, roughly right
+cards (jitter), and the six numbers Clarity reads."""
 
 from __future__ import annotations
 
@@ -49,3 +49,14 @@ def test_roughly_right_cards():
     first = np.stack([m[0] for m in moved])
     assert first[:, 5].std() > 0 and first[:, 8].std() > 0  # it does move them
     assert not np.array_equal(moved[0][0], moved[0][1])  # each band its own error
+
+
+def test_what_clarity_reads():
+    d = desc.describe(*RED, 20, 10, 0.25, AB, 1e-3, 1.2, surface=True)
+    c = desc.card(d)
+    assert c.shape == (desc.N_CARD,) == (6,)
+    assert c[:3].tolist() == d[:3].tolist()  # the wavelengths
+    assert c[3] == 1.0 and c[4] == 1.0  # surface reflectance; a 20 m band on a 10 m grid
+    assert c[5] == d[desc.GSD] == 0.0  # 10 m grid
+    stacked = desc.card(np.stack([d, d, d]))
+    assert stacked.shape == (3, 6) and (stacked[1] == c).all()

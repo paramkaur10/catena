@@ -1,4 +1,5 @@
-"""Catena's network: a band encoder for any set of bands, and a U-Net tuned by the sensor.
+"""Clarity, Catena's network: a band encoder for any set of bands, and a U-Net tuned by the
+sensor.
 
 Band encoder:
   1. each band's descriptor (15 numbers; 14 before the pixel size joined) becomes a vector of
@@ -15,7 +16,9 @@ and width must be multiples of 8.
 
 FiLM starts at zero (gamma 1, beta 0), so training starts from a plain U-Net. For one fixed
 sensor every FiLM is a constant that fold_block() bakes into the GroupNorm before flight.
-2,185,141 parameters with the default sizes; the budget is 3.75 M.
+2,185,141 parameters with the default sizes, 4.4 MB at float16; reading the 6 numbers of the
+card (fields=6, catena.descriptor.card), as in the big run, 2,184,565. The budget is 6 MB at
+float16, the copy that flies: 3 M parameters.
 """
 
 from __future__ import annotations
@@ -89,7 +92,7 @@ class BandEncoder(nn.Module):
         return torch.cat([mean, peak], dim=1), sensor
 
 
-class CatenaNet(nn.Module):
+class Clarity(nn.Module):
     def __init__(
         self, widths=(32, 64, 128, 256), classes: int = 4, stem: int = 16, fields: int = N_FIELDS
     ):
@@ -140,7 +143,7 @@ def fold_block(block: ConvFiLM, z: torch.Tensor) -> None:
 
 
 if __name__ == "__main__":  # shape and size check, about a second on a CPU
-    net = CatenaNet().eval()
+    net = Clarity().eval()
     x, d = torch.rand(2, 5, 64, 64), torch.randn(2, 5, N_FIELDS)
     real = torch.tensor([[True] * 5, [True] * 3 + [False] * 2])  # second image: 3 bands
     with torch.no_grad():

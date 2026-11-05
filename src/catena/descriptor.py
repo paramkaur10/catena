@@ -16,7 +16,8 @@ known values the same way, so the model learns to work with gaps, and jitter mov
 known values by errors the size real specs carry, so the model does not trust them blindly.
 The blind arm (blind) keeps the three wavelength fields, which is what SEnSeI is told, and
 the pixel size on the ground, which every sensor publishes: told and blind differ only in
-the imaging chain.
+the imaging chain. Clarity, the model of the big run, reads the card (card): the wavelength
+fields, surface, sampling and gsd, six facts every product's metadata states.
 
 The step is one level of the bits the camera digitises, over its range up to saturation:
 top / (2^bits - 1). That is the same rule for every camera, simulated or real, whatever
@@ -64,6 +65,8 @@ DARK, BRIGHT = 0.05, 0.5  # the two reflectance levels the noise is told at
 
 # what dropout hides together: the value columns of each group and their flag column
 CHAIN = {"psf": ([5], 10), "noise": ([6, 7], 11), "step": ([8], 12), "top": ([9], 13)}
+CARD = (0, 1, 2, 3, 4, GSD)  # lo, mid, hi, surface, sampling, gsd: what Clarity reads
+N_CARD = len(CARD)
 
 
 def wavelength_code(nm: float) -> float:
@@ -149,6 +152,14 @@ def jitter(desc: np.ndarray, rng: np.random.Generator, scale: float = 1.0) -> np
     moved = np.minimum(d[:, top] * (1 + rng.uniform(-0.15 * scale, 0.15 * scale, n)), 2.0)
     d[:, top] = np.where(known, moved, d[:, top])
     return d
+
+
+def card(desc):
+    """What Clarity reads about each band, (..., 15) -> (..., 6): the three wavelength fields,
+    surface or top-of-atmosphere reflectance, the band's pixel size against the grid's, and
+    the grid's pixel size on the ground. Every product states them; nothing about the imaging
+    chain. Takes a numpy array or a torch tensor."""
+    return desc[..., list(CARD)]
 
 
 def blind(desc: np.ndarray) -> np.ndarray:

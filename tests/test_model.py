@@ -8,13 +8,13 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from catena.descriptor import N_FIELDS  # noqa: E402
-from catena.model import CatenaNet, FiLM, count_parameters, fold_block  # noqa: E402
+from catena.descriptor import N_CARD, N_FIELDS  # noqa: E402
+from catena.model import Clarity, FiLM, count_parameters, fold_block  # noqa: E402
 
 
 def small(train: bool = False):
     torch.manual_seed(0)
-    net = CatenaNet(widths=(8, 16, 16, 16), stem=8)
+    net = Clarity(widths=(8, 16, 16, 16), stem=8)
     return net.train() if train else net.eval()
 
 
@@ -27,12 +27,20 @@ def inputs(batch=2, bands=5, size=24):
 
 
 def test_shape_and_size():
-    net = CatenaNet().eval()
-    assert count_parameters(net) == 2_185_141  # the budget is 3.75 M
+    net = Clarity().eval()
+    assert count_parameters(net) == 2_185_141  # 4.4 MB at float16; the budget is 6 MB
     x, d, real = inputs(size=48)
     real[1, 3:] = False  # the second image has 3 bands
     with torch.no_grad():
         assert net(x, d, real).shape == (2, 4, 48, 48)
+
+
+def test_the_model_that_reads_the_card():
+    net = Clarity(fields=N_CARD).eval()
+    assert count_parameters(net) == 2_184_565  # 6 numbers per band instead of 15
+    x, d, real = inputs(size=24)
+    with torch.no_grad():
+        assert net(x, d[..., :N_CARD], real).shape == (2, 4, 24, 24)
 
 
 def test_band_order_and_padding_change_nothing():
@@ -50,7 +58,7 @@ def test_band_order_and_padding_change_nothing():
 
 def test_a_network_with_fewer_fields_reads_the_first_ones():
     torch.manual_seed(0)
-    old = CatenaNet(widths=(8, 16, 16, 16), stem=8, fields=N_FIELDS - 1).eval()  # the pilot's
+    old = Clarity(widths=(8, 16, 16, 16), stem=8, fields=N_FIELDS - 1).eval()  # the pilot's
     assert old.bands.embed[0].weight.shape[1] == N_FIELDS - 1
     x, d, real = inputs()
     with torch.no_grad():

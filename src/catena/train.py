@@ -54,7 +54,7 @@ from torch.utils.data import DataLoader, Dataset
 from catena import descriptor as desc
 from catena import sim
 from catena.data import biome, loader
-from catena.model import CatenaNet, count_parameters
+from catena.model import Clarity, count_parameters
 
 ARMS = ("told", "blind")
 NAMES = ("clear", "thin", "thick", "shadow")
@@ -488,7 +488,7 @@ def main(argv: list[str] | None = None) -> None:
     torch.set_float32_matmul_precision("high")
 
     torch.manual_seed(args.seed)
-    first = CatenaNet(widths=tuple(args.widths), stem=args.stem)
+    first = Clarity(widths=tuple(args.widths), stem=args.stem)
     models = {"told": first, "blind": copy.deepcopy(first)}  # the same starting weights
     for arm, net in models.items():
         net.to(devices[arm]).train()
