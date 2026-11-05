@@ -1,13 +1,18 @@
-"""Write the label notebooks into notebooks/: one review notebook per set of OmniCloudMask
-drafts (IRIDE HEO, IRIDE Eaglet II, Phi-sat-2), to check and correct them, and one example
-notebook per hand-labelled dataset (CloudSEN12+, L8 Biome, L7 Irish, CloudPeru2), to show
-their labels.
+"""Write the notebooks into notebooks/, without outputs (run them in Jupyter):
+
+  labelling_<dataset>.ipynb   how the labels of IRIDE HEO, IRIDE Eaglet II and Phi-sat-2 were
+                              made: the review, the rules of every corrected scene
+                              (catena.label_fixes), a check that makes every label again
+                              from its OmniCloudMask draft, and the tools to label new scenes
+  labels_<dataset>.ipynb      the labels themselves, as pictures: the three above and the
+                              hand-labelled datasets CloudSEN12+, L8 Biome, L7 Irish and
+                              CloudPeru2
 
     python scripts/make_notebooks.py [--out notebooks] [--force]
 
-The notebooks are written without outputs: run them in Jupyter. A notebook that exists is
-left alone (it may hold your work) unless --force. They read the data from /root/catena_data
-(DATA in their first cell). Edit this script, not the notebooks, to change them for good.
+A notebook that exists is left alone (it may hold your work) unless --force. They read the
+data from /root/catena_data (DATA in their first cell). Edit this script, not the
+notebooks, to change them for good.
 """
 
 from __future__ import annotations
@@ -18,72 +23,143 @@ from pathlib import Path
 
 KERNEL = {"display_name": "Python 3", "language": "python", "name": "python3"}
 
-REVIEWS = {
+LABELLED = {
     "iride_heo": {
         "title": "IRIDE HEO",
         "draft": "ocm4",
         "other": None,
-        "about": (
-            "IRIDE HEO (Argotec HAWK), Level-1C, 8 bands at 2.5 m (red edges at 5 m). The "
-            "drafts were made at 5 m from red B03, green B02 and near-infrared B07. HEO is a "
-            "training sensor: 16 scenes for training, 4 for testing, and the three A02 "
-            "products of March as a stress test (their red edges B04 and B06 read about 0.3 "
-            "of B05). Watch for bright desert called thin cloud (IMH02 over Algeria, 9 Oct)."
+        "sensor": (
+            "IRIDE HEO (Argotec HAWK), Level-1C top-of-atmosphere reflectance, 8 bands at "
+            "2.5 m with the red edges at 5 m. The drafts and the labels are on a 5 m grid; the "
+            "drafts were made from red B03, green B02 and near-infrared B07. HEO trains the "
+            "networks (16 scenes) and tests them on scenes they never saw (4), and the three "
+            "March 2026 products of processing version A02, whose red edges 1 and 3 read about "
+            "0.3 of red edge 2, are a stress test."
         ),
     },
     "iride_eaglet2": {
         "title": "IRIDE Eaglet II",
         "draft": "ocm4_nirblue",
         "other": "ocm4_nirzeros",
-        "about": (
+        "sensor": (
             "IRIDE Eaglet II (OHB), Level-1C, three broad bands (red about 665-835 nm, green, "
-            "blue) at about 1.9-2.6 m, drafted at 5 m. It has no near-infrared band, so "
-            "OmniCloudMask was given blue (ocm4_nirblue) or zeros (ocm4_nirzeros) in its "
-            "place; with zeros it misses large cloud fields. Eaglet II is a test sensor, the "
-            "camera no network trains on: its labels must be corrected, not only approved, "
-            "or a comparison with OmniCloudMask would favour OmniCloudMask."
+            "blue) at about 1.9-2.6 m, labelled on a 5 m grid. It has no near-infrared band, "
+            "so OmniCloudMask was given blue (ocm4_nirblue) or zeros (ocm4_nirzeros) in its "
+            "place. Eaglet II is a test satellite only: no network trains on it."
         ),
     },
     "phisat2": {
         "title": "Phi-sat-2",
         "draft": "ocm4",
         "other": None,
-        "about": (
+        "sensor": (
             "Phi-sat-2 (ESA, Open Cosmos): 8 bands at about 4.75 m on a longitude-latitude "
             "grid, delivered as radiance from before the processor's reflectance step and "
-            "turned into top-of-atmosphere reflectance by catena.data.phisat2. The drafts sit "
-            "on the product's own grid. A test sensor: check snow, which OmniCloudMask may "
-            "call cloud, and correct the labels rather than only approve them."
+            "turned into top-of-atmosphere reflectance by catena.data.phisat2; labelled on the "
+            "product's own grid. A test satellite only: no network trains on it."
         ),
     },
 }
 
-REVIEW_INTRO = """\
-# __TITLE__: reviewing the OmniCloudMask drafts
+COLOURS = (
+    "**Colours:** thin cloud yellow, thick cloud red, shadow blue; grey has no label (no data, "
+    "or left out on purpose, so that no test scores it)."
+)
 
-__ABOUT__
+LABELLING_INTRO = (
+    """\
+# __TITLE__: how the labels were made
 
-**Colours:** thin cloud yellow, thick cloud red, shadow blue; grey has no data.
+__SENSOR__
 
-**Verdicts:** `keep` (the draft is right), `all_clear` (no cloud and no shadow), `correct`
-(it needs correcting by hand), `drop` (not usable). **Roles:** `train`, `test`, `stress`.
+**How.** OmniCloudMask 1.8.0 (model 4.0) drafted every scene (`scripts/ocm_prelabel.py`).
+Each draft was reviewed and given a role (`train`, `test` or `stress`) and a verdict:
+`keep` (the draft is right), `all_clear` (no cloud and no shadow), `correct` (it needs
+correcting) or `drop`. A scene to correct got rules: steps applied to its draft in order,
+each acting on the pixels of some classes, brighter or darker than a level of the scene's
+own brightness, and inside a box when one is given. The rules of every corrected scene are
+recorded in `catena/label_fixes.py`, and the check below makes every label again from its
+draft. Rules rather than painting: they are written down, they act the same way on every
+pixel they name, and they leave the labels open to checking. The labels start from
+OmniCloudMask's drafts, which a comparison with OmniCloudMask must bear in mind: the check
+reports how much of each draft the review changed.
 
-**Steps:** look at the table and the review pages; open a scene and zoom where OmniCloudMask was
-least sure; correct it here (`s.edit`, then `d.save_label`) or record a verdict; run
-`set_review.py` to put the verdicts into `scenes.csv`; make the labels of the kept scenes."""
+"""
+    + COLOURS
+)
 
-REVIEW_SETUP = """\
+LABELLING_SETUP = """\
 from pathlib import Path
 
 from IPython.display import HTML, Image, display
 
-from catena import drafts
+from catena import drafts, label_fixes, viz
 
 DATA = Path("/root/catena_data")
 REPO = Path.home() / "projects" / "catena"
 d = drafts.Drafts(DATA, "__DATASET__", draft="__DRAFT__")
+FIXES = label_fixes.FIXES["__DATASET__"]
 print(d)
 HTML(d.html())"""
+
+RULES_TEXT = """\
+## The rules, scene by scene
+
+First the steps a rule can use, then every corrected scene with its steps and a note.
+Brightness is the scene's own, 0 its darkest pixel and 1 its brightest, as in its true
+colour; a box is (top, bottom, left, right) as fractions of the scene's height and width."""
+
+RULES = """\
+for step, meaning in drafts.STEPS.items():
+    print(f"{step:<6} {meaning}")
+print()
+for name, (steps, note) in FIXES.items():
+    role = d.reviews.get(name, {}).get("role", "-")
+    print(f"{name} ({role}): {note}")
+    for step in steps or ["the draft as it is"]:
+        print("    ", step)"""
+
+CHECK_TEXT = """\
+## Check: every label made again from its draft
+
+Each reviewed scene's label made again from its draft, by its verdict and its rules, and
+compared with its `label.tif`. `differ` counts the pixels that are not the same: 0 means the
+file is exactly what the record makes. `changed` is the share of the labelled pixels the
+review changed from the draft, `unlabelled` the share it left without a label. The pictures
+show the true colour, the draft and the label, with the boxes of the rules in cyan."""
+
+CHECK = """\
+rows = d.check(FIXES)
+columns = ["scene", "role", "verdict", "differ", "pixels", "changed", "unlabelled"]
+display(HTML(viz.html_table(rows, columns)))
+for role in drafts.ROLES:
+    mine = [r for r in rows if r["role"] == role]
+    if mine:
+        pixels = sum(r["pixels"] for r in mine)
+        changed = sum(r["pixels"] * r["changed"] for r in mine) / max(pixels, 1)
+        same = sum(r["differ"] == 0 for r in mine)
+        print(
+            f"{role}: {len(mine)} scenes, {same} the same as their label.tif; the review "
+            f"changed {changed:.1%} of their {pixels:,} labelled pixels"
+        )"""
+
+REMAKE_TEXT = """\
+## Writing the labels again
+
+After a rule changes in `catena/label_fixes.py`, set `WRITE = True` and run this cell: every
+corrected scene's `label.tif` is written again from its draft (the `all_clear` and `keep`
+scenes are made by `set_review.py` and `keep_labels()`, below). Then run the check again."""
+
+REMAKE = """\
+WRITE = False
+if WRITE:
+    for name, (steps, note) in FIXES.items():
+        d.fix(name, steps, note, who="Param")"""
+
+TOOLS_TEXT = """\
+# Tools for new scenes
+
+The review pages show every scene's true colour beside its draft."""
 
 PAGES = """\
 for page in d.pages():
@@ -94,8 +170,8 @@ SCENE_TEXT = """\
 
 `todo` lists the scenes still to do (not reviewed, or to correct and without `label.tif`);
 `name` is the first of them, or put any scene's name from the table. Four pictures: the true
-colour, the draft, the working label (`label.tif` if the scene has one, else the draft, with
-your edits) and how sure OmniCloudMask was (1 = sure)."""
+colour, the draft, the working label (`label.tif` if the scene has one, else the draft) and
+how sure OmniCloudMask was (1 = sure)."""
 
 SCENE = """\
 todo = [n for n in d.names if d.reviews[n].get("verdict") in ("", "correct")]
@@ -109,7 +185,7 @@ d.show(s)"""
 ZOOM_TEXT = """\
 ## Closer: where OmniCloudMask was least sure
 
-Windows of 400 x 400 pixels at full resolution. Their axes give rows and columns, for edits.
+Windows of 400 x 400 pixels at full resolution. Their axes give rows and columns.
 `d.zoom(s, row, col, size)` shows any other window."""
 
 ZOOM = """\
@@ -124,27 +200,20 @@ The same scene drafted with the near-infrared input filled the other way."""
 
 COMPARE = 'd.compare(s, "__OTHER__")'
 
-EDIT_TEXT = """\
-## Correcting a scene here
+FIX_TEXT = """\
+## Correcting a scene
 
-`s.edit(to, ...)` sets pixels of the working label to class `to` (0 clear, 1 thin, 2 thick,
-3 shadow, 255 no label). Each condition you add narrows where: `where=` the classes to change
-(one or a list), `box=(row0, row1, col0, col1)` read off the zoom axes, `below=` OmniCloudMask's
-certainty under this, `brighter=` or `darker=` the pixel's brightness in the true colour (0 the
-scene's darkest, 1 its brightest) above or under this. Look again with `d.show(s)` or
-`d.zoom(...)`; nothing is saved until `d.save_label(s)`, which writes `label.tif` with the edits
-in its tags. To start again, run the scene cell once more. To correct by hand instead,
-`d.export_for_editing(s)` writes `rgb.tif` and `label_start.tif` for QGIS; save the corrected
-file as `label.tif` in the scene's folder."""
+Try rules on the scene with `d.apply(s, steps)` and `d.picture(s, boxes)`; when they are
+right, `d.fix(name, steps, note, who=...)` writes `label.tif`. Then add the scene, its steps
+and the note to `catena/label_fixes.py`, so that the record stays complete and the check
+passes."""
 
-EDIT = """\
-# s.edit(1, where=2, darker=0.6)                      # dim "thick" you can see through: thin
-# s.edit(2, where=3, brighter=0.5)                    # "shadow" inside a bright cloud: thick
-# s.edit(0, where=3, brighter=0.3)                    # "shadow" that is not dark: clear
-# s.edit(0, where=1)                                  # all its thin cloud is clear ground
-# s.edit(0, box=(0, 800, 1200, 2000), where=[1, 2])   # no cloud in this box
-# d.show(s)
-# d.save_label(s, who="Param", note="")"""
+FIX = """\
+steps = [("cores", 0.85), ("trim", 0.3)]  # for example; the steps are in drafts.STEPS
+boxes = d.apply(s, steps)
+print("; ".join(s.edits))
+d.picture(s, boxes)
+# d.fix(s.name, steps, "what was wrong and what the rules do", who="Param")"""
 
 DECIDE_TEXT = """\
 ## Verdicts
@@ -155,7 +224,7 @@ runs `scripts/set_review.py`, which puts them into `scenes.csv` (and makes `labe
 
 DECIDE = """\
 decisions = [
-    # dict(scene=name, role="train", verdict="keep", notes=""),
+    # dict(scene=name, role="test", verdict="correct", notes=""),
 ]
 review = d.decide(decisions) if decisions else None
 print(review)"""
@@ -179,6 +248,49 @@ KEEP_TEXT = """\
 `label.tif` is never touched)."""
 
 KEEP = 'print("label.tif made for:", d.keep_labels())'
+
+PICTURES_INTRO = (
+    """\
+# __TITLE__: labels
+
+__SENSOR__
+
+The labels: OmniCloudMask drafts, reviewed and corrected by rules scene by scene; how, and
+the rules of every scene, in `labelling___DATASET__.ipynb`. Below, every labelled scene by
+role: `train` scenes are used in training, `test` scenes only in testing, `stress` scenes
+test products with known faults. Each scene is shown every k-th pixel, about 900 across.
+
+"""
+    + COLOURS
+)
+
+PICTURES = """\
+from pathlib import Path
+
+import numpy as np
+from IPython.display import HTML, display
+
+from catena import drafts, viz
+
+d = drafts.Drafts(Path("/root/catena_data"), "__DATASET__", draft="__DRAFT__")
+rows = [r for r in d.table() if r["label.tif"]]
+display(HTML(viz.html_table(rows, ["scene", "role", "verdict", "notes"])))
+for role in drafts.ROLES:
+    names = [r["scene"] for r in rows if r["role"] == role]
+    if not names:
+        continue
+    counts, items = np.zeros(256, np.int64), []
+    for name in names:
+        s = d.scene(name)
+        counts += np.bincount(s.label.ravel(), minlength=256)
+        k = viz.step(s.label.shape, 900)
+        picture = s.picture[::k, ::k]
+        drawn = viz.overlay(picture, s.label[::k, ::k])
+        items.append((picture, drawn, f"{name}\\n{viz.describe(s.label)}"))
+    labelled = max(int(counts[:4].sum()), 1)
+    shares = ", ".join(f"{viz.NAMES[c]} {counts[c] / labelled:.1%}" for c in range(4))
+    print(f"{role}: {len(names)} scenes, {labelled:,} labelled pixels: {shares}")
+    viz.sheet(items, per_row=2)"""
 
 EXAMPLES = {
     "cloudsen12plus": (
@@ -363,11 +475,11 @@ def notebook(cells: list[dict]) -> dict:
     return {"cells": cells, "metadata": metadata, "nbformat": 4, "nbformat_minor": 4}
 
 
-def review(dataset: str, spec: dict) -> dict:
+def filler(dataset: str, spec: dict):
     def fill(text: str) -> str:
         for key, value in (
             ("__TITLE__", spec["title"]),
-            ("__ABOUT__", spec["about"]),
+            ("__SENSOR__", spec["sensor"]),
             ("__DATASET__", dataset),
             ("__DRAFT__", spec["draft"]),
             ("__OTHER__", spec["other"] or ""),
@@ -375,13 +487,22 @@ def review(dataset: str, spec: dict) -> dict:
             text = text.replace(key, value)
         return text
 
+    return fill
+
+
+def labelling(dataset: str, spec: dict) -> dict:
+    """The record of how a dataset's labels were made, and the tools to label new scenes."""
+    fill = filler(dataset, spec)
     cells = [
-        cell("markdown", fill(REVIEW_INTRO)),
-        cell("code", fill(REVIEW_SETUP)),
-        cell(
-            "markdown",
-            "## All scenes at a glance\n\nThe review pages: true colour beside the draft.",
-        ),
+        cell("markdown", fill(LABELLING_INTRO)),
+        cell("code", fill(LABELLING_SETUP)),
+        cell("markdown", RULES_TEXT),
+        cell("code", RULES),
+        cell("markdown", CHECK_TEXT),
+        cell("code", CHECK),
+        cell("markdown", REMAKE_TEXT),
+        cell("code", REMAKE),
+        cell("markdown", TOOLS_TEXT),
         cell("code", PAGES),
         cell("markdown", SCENE_TEXT),
         cell("code", SCENE),
@@ -391,8 +512,8 @@ def review(dataset: str, spec: dict) -> dict:
     if spec["other"]:
         cells += [cell("markdown", COMPARE_TEXT), cell("code", fill(COMPARE))]
     cells += [
-        cell("markdown", EDIT_TEXT),
-        cell("code", EDIT),
+        cell("markdown", FIX_TEXT),
+        cell("code", FIX),
         cell("markdown", DECIDE_TEXT),
         cell("code", DECIDE),
         cell("code", SET_REVIEW),
@@ -402,13 +523,20 @@ def review(dataset: str, spec: dict) -> dict:
     return notebook(cells)
 
 
+def pictures(dataset: str, spec: dict) -> dict:
+    """Every labelled scene of a dataset, as pictures."""
+    fill = filler(dataset, spec)
+    return notebook([cell("markdown", fill(PICTURES_INTRO)), cell("code", fill(PICTURES))])
+
+
 def example(text: str, code: str) -> dict:
     return notebook([cell("markdown", text), cell("code", code)])
 
 
 def build() -> dict[str, dict]:
     """Every notebook, by file name."""
-    books = {f"review_{k}.ipynb": review(k, spec) for k, spec in REVIEWS.items()}
+    books = {f"labelling_{k}.ipynb": labelling(k, spec) for k, spec in LABELLED.items()}
+    books |= {f"labels_{k}.ipynb": pictures(k, spec) for k, spec in LABELLED.items()}
     books |= {f"labels_{k}.ipynb": example(*parts) for k, parts in EXAMPLES.items()}
     return books
 

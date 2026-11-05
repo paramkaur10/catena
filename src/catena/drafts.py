@@ -1,16 +1,16 @@
 """The OmniCloudMask drafts of one dataset (scripts/ocm_prelabel.py), to review and correct
-in a notebook (notebooks/review_<dataset>.ipynb).
+in a notebook (notebooks/labelling_<dataset>.ipynb).
 
-    from catena import drafts
+    from catena import drafts, label_fixes
     d = drafts.Drafts(Path("/root/catena_data"), "iride_heo")   # or draft="ocm4_nirblue"
     HTML(d.html())                        # one row per scene: review state, the draft's shares
     s = d.scene("IMH07_20261007T084546")  # true colour, draft, certainty, label: one grid
     d.show(s)                             # true colour | draft | working label | certainty
     for row, col, sure in d.unsure(s):    # where OmniCloudMask was least sure
         d.zoom(s, row, col)
-    s.edit(0, where=1)                    # e.g. its thin cloud is bright desert: clear
-    d.save_label(s, who="Param")          # label.tif
-    d.decide([dict(scene=s.name, role="train", verdict="keep")])   # review_<day>.csv
+    d.fix(s.name, [("cores", 0.85), ("trim", 0.3)], "cores thick", who="Param")  # label.tif
+    d.decide([dict(scene=s.name, role="train", verdict="correct")])   # review_<day>.csv
+    rows = d.check(label_fixes.FIXES["iride_heo"])   # every label made again from its draft
 
 Layout, as ocm_prelabel.py and set_review.py leave it: DATA/labels/<dataset>/ holds
 scenes.csv (one row per scene, with the review columns role, verdict, use, labeller, date,
@@ -26,11 +26,16 @@ cell; Phi-sat-2 on its own grid as top-of-atmosphere reflectance (catena.data.ph
 picture and the draft match pixel for pixel.
 
 Verdicts: keep (the draft is right), all_clear (no cloud and no shadow), correct (it needs
-correcting by hand), drop (not usable). Roles: train, test, stress. decide() writes decisions
-to review_<day>.csv, which scripts/set_review.py puts into scenes.csv (and it makes label.tif
-for all_clear scenes); keep_labels() then makes label.tif from the draft for kept scenes. A
-scene to correct is edited here (Scene.edit, then save_label) or by hand in QGIS from the
-files export_for_editing() writes; either way the result is its label.tif.
+correcting), drop (not usable). Roles: train, test, stress. decide() writes decisions to
+review_<day>.csv, which scripts/set_review.py puts into scenes.csv (and it makes label.tif for
+all_clear scenes); keep_labels() then makes label.tif from the draft for kept scenes.
+
+A scene to correct gets rules: steps applied to its draft in order (STEPS, apply_steps), each
+acting on the pixels of some classes, brighter or darker than a level of the scene's own
+brightness, and inside a box if one is given. fix() applies them and writes label.tif; the
+rules of every corrected scene are recorded in catena.label_fixes, and check() makes every
+label again from its draft by its verdict and rules, so the files and the record cannot drift
+apart. (Scene.edit and export_for_editing, for corrections by hand in QGIS, remain.)
 """
 
 from __future__ import annotations
@@ -57,6 +62,22 @@ SHARES = ("valid", "clear", "thick", "thin", "shadow")  # drafts.csv's numbers
 CLASSES = "0 clear, 1 thin cloud, 2 thick cloud, 3 cloud shadow, 255 no label"
 CODES = (0, 1, 2, 3, viz.NO_LABEL)  # what a label may hold
 GAMMA = 0.5  # lifts the dark parts of the true colour: sea, shadow, thin cloud over sea
+# the steps of a correction (apply_steps); v is the brightness level, 0 to 1
+STEPS = {
+    "start": "start from another draft of the scene: (start, its name)",
+    "frame": "no label where a band of the true colour has no data",
+    "cores": "clear brighter than v: thick cloud (bright cores the draft left clear)",
+    "pale": "clear brighter than v: thin cloud",
+    "trim": "shadow brighter than v: clear",
+    "grey": "shadow brighter than v: thin cloud",
+    "lift": "shadow brighter than v: thick cloud",
+    "thin": "thick cloud darker than v: thin",
+    "thick": "thin cloud brighter than v: thick",
+    "dark": "thin or thick cloud darker than v: clear (dark ground or sea called cloud)",
+    "haze": "by brightness alone: clear, thin from v0, thick from v1: (haze, v0, v1)",
+    "set": "one class, or a list of classes, to another: (set, from, to)",
+    "skip": "no label: cannot be told apart, so no test scores it",
+}
 
 
 def read_rows(path: Path) -> list[dict]:
@@ -225,6 +246,67 @@ class Scene:
         if self.edits:
             lines.append(f"  edits not yet saved: {'; '.join(self.edits)}")
         return "\n".join(lines)
+
+
+def apply_steps(scene: Scene, steps, other=None) -> list[tuple[int, int, int, int]]:
+    """Make a scene's working label again: its draft with the steps applied in order. A step
+    is a tuple (name, values...) of STEPS; one that ends with a box (top, bottom, left, right),
+    as fractions of the scene's height and width, acts only inside it. Brightness is the
+    scene's (Scene.brightness). other(name) gives another draft of the scene in Catena's
+    codes, for start. Nothing is saved; scene.edits says what each step changed. Returns the
+    boxes in pixels: (row0, row1, col0, col1)."""
+    scene.label, scene.edits, scene.work = None, [], scene.draft.copy()
+    h, w = scene.draft.shape
+    bright = scene.brightness
+    valid = scene.valid.copy()
+    boxes = []
+    for step in steps:
+        name, *v = step
+        if name not in STEPS:
+            raise ValueError(f"{scene.name}: no step {name!r}; the steps: {', '.join(STEPS)}")
+        inside, box = valid.copy(), None
+        if v and isinstance(v[-1], tuple):
+            top, bottom, left, right = v.pop()
+            box = (round(top * h), round(bottom * h), round(left * w), round(right * w))
+            part = np.zeros_like(inside)
+            part[box[0] : box[1], box[2] : box[3]] = True
+            inside &= part
+            boxes.append(box)
+        before, work = scene.work.copy(), scene.work
+        if name == "start":
+            if other is None:
+                raise ValueError(f"{scene.name}: start needs the scene's other drafts")
+            scene.work = np.array(other(v[0]), np.uint8)
+        elif name == "frame":
+            frame = (scene.rgb == 0).any(axis=0)
+            work[frame] = viz.NO_LABEL
+            valid &= ~frame
+        elif name in ("cores", "pale", "trim", "grey", "lift", "thick"):
+            source, target = {
+                "cores": (0, 2),
+                "pale": (0, 1),
+                "trim": (3, 0),
+                "grey": (3, 1),
+                "lift": (3, 2),
+                "thick": (1, 2),
+            }[name]
+            work[inside & (work == source) & (bright > v[0])] = target
+        elif name == "thin":
+            work[inside & (work == 2) & (bright < v[0])] = 1
+        elif name == "dark":
+            work[inside & np.isin(work, [1, 2]) & (bright < v[0])] = 0
+        elif name == "haze":
+            work[inside] = 0
+            work[inside & (bright >= v[0])] = 1
+            work[inside & (bright >= v[1])] = 2
+        elif name == "set":
+            work[inside & np.isin(work, v[0])] = v[1]
+        else:  # skip
+            work[inside] = viz.NO_LABEL
+        place = f" in rows {box[0]}-{box[1]}, columns {box[2]}-{box[3]}" if box else ""
+        changed = int((scene.work != before).sum())
+        scene.edits.append(f"{' '.join(map(str, [name, *v]))}{place}: {changed:,} pixels changed")
+    return boxes
 
 
 class Drafts:
@@ -449,6 +531,90 @@ class Drafts:
             write(self.labels / name / "label.tif", viz.FROM_OCM[codes], grid_of(source), tags)
             done.append(name)
         return done
+
+    def apply(self, scene: Scene, steps) -> list[tuple[int, int, int, int]]:
+        """apply_steps, with the scene's other drafts at hand for start."""
+        return apply_steps(scene, steps, lambda draft: self.codes(scene.name, draft))
+
+    def picture(self, scene: Scene, boxes=(), title=None, longest=1000, show: bool = True):
+        """True colour, the draft and the working label side by side, every k-th pixel, with
+        full-resolution rows and columns on the axes and the boxes drawn in cyan."""
+        k = viz.step(scene.draft.shape, longest)
+        p = scene.picture[::k, ::k]
+        h, w = scene.draft.shape
+        pictures = [p, viz.overlay(p, scene.draft[::k, ::k]), viz.overlay(p, scene.work[::k, ::k])]
+        titles = [
+            "true colour",
+            f"draft {self.draft}\n{viz.describe(scene.draft)}",
+            f"label\n{viz.describe(scene.work)}",
+        ]
+        title = title or scene.name
+        return viz.panels(pictures, titles, 6, title, extent=(0, w, h, 0), boxes=boxes, show=show)
+
+    def fix(self, name: str, steps, note: str = "", who: str = "", show: bool = True) -> Scene:
+        """Correct a scene by rules: its draft with the steps applied (apply_steps) is written
+        as label.tif, the steps and the note in its tags, then shown. Record the steps in
+        catena.label_fixes too, so that check() can make the label again."""
+        scene = self.scene(name)
+        boxes = self.apply(scene, steps)
+        done = "; ".join(scene.edits) or "the draft as it is"
+        self.save_label(scene, who=who, note=note)
+        print(f"{name}: {note}\n   {done}\n   label.tif: {viz.describe(scene.label)}")
+        if show:
+            self.picture(scene, boxes)
+        return scene
+
+    def remake(self, name: str, fixes: dict):
+        """The scene's label made again from its draft, as its review says: the draft (keep),
+        clear wherever the draft has data (all_clear) or the draft with the scene's steps
+        (correct; fixes: this dataset's catena.label_fixes). Returns the scene, its working
+        label now the label made again, its label.tif as it was (None if there is none) and
+        the boxes; nothing is written."""
+        scene = self.scene(name)
+        saved = scene.label
+        verdict = self.reviews[name].get("verdict", "")
+        if verdict == "keep":
+            steps = []
+        elif verdict == "all_clear":
+            steps = [("set", [1, 2, 3], 0)]
+        elif verdict == "correct":
+            if name not in fixes:
+                raise KeyError(f"{name} was corrected, but catena.label_fixes has no rules for it")
+            steps = fixes[name][0]
+        else:
+            raise ValueError(f"{name}: a scene with verdict {verdict or 'none'!r} has no label")
+        return scene, saved, self.apply(scene, steps)
+
+    def check(self, fixes: dict, show: bool = True) -> list[dict]:
+        """Every scene with a verdict of keep, all_clear or correct made again from its draft
+        (remake) and compared with its label.tif. One row per scene: differ, the pixels that
+        are not the same (0: the file is what the record makes; None: no label.tif); pixels,
+        those labelled in both the draft and the label; changed, the share of them the review
+        changed; unlabelled, the share of the draft's labelled pixels the review left without
+        a label. With show, each scene's picture."""
+        rows = []
+        for name in self.names:
+            review = self.reviews[name]
+            if review.get("verdict") not in ("keep", "all_clear", "correct"):
+                continue
+            scene, saved, boxes = self.remake(name, fixes)
+            drafted = scene.draft != viz.NO_LABEL
+            both = drafted & (scene.work != viz.NO_LABEL)
+            row = {
+                "scene": name,
+                "role": review.get("role", ""),
+                "verdict": review["verdict"],
+                "differ": None if saved is None else int((saved != scene.work).sum()),
+                "pixels": int(both.sum()),
+                "changed": float((scene.draft != scene.work)[both].mean()) if both.any() else 0.0,
+                "unlabelled": float((~both)[drafted].mean()) if drafted.any() else 0.0,
+            }
+            rows.append(row)
+            if show:
+                state = "no label.tif" if saved is None else f"{row['differ']:,} pixels differ"
+                title = f"{name} ({row['role']}, {row['verdict']}): {state}"
+                self.picture(scene, boxes, title=title)
+        return rows
 
     def export_for_editing(self, scene: Scene) -> tuple[Path, Path]:
         """rgb.tif (the true colour in 8 bits, 255 = no data) and label_start.tif (the working

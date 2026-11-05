@@ -108,9 +108,11 @@ def _legend(ax, codes=(1, 2, 3)) -> None:
     ax.legend(handles=handles, loc="lower right", fontsize=8, framealpha=0.85)
 
 
-def _draw(ax, picture: np.ndarray, title: str, origin: tuple | None = None) -> None:
-    """One picture; with origin (row, col) its axes count rows and columns from there."""
-    extent = None
+def _draw(
+    ax, picture: np.ndarray, title: str, origin: tuple | None = None, extent: tuple | None = None
+) -> None:
+    """One picture; with origin (row, col) its axes count rows and columns from there, with
+    extent (left, right, bottom, top) they span those numbers."""
     if origin is not None:
         h, w = picture.shape[:2]
         extent = (origin[1] - 0.5, origin[1] + w - 0.5, origin[0] + h - 0.5, origin[0] - 0.5)
@@ -122,7 +124,7 @@ def _draw(ax, picture: np.ndarray, title: str, origin: tuple | None = None) -> N
     else:
         ax.imshow(picture, interpolation="nearest", extent=extent)
     ax.set_title(title, fontsize=9)
-    if origin is None:
+    if extent is None:
         ax.set_axis_off()
     else:
         ax.tick_params(labelsize=7)
@@ -136,16 +138,24 @@ def panels(
     origin: tuple | None = None,
     legend: tuple = (1, 2, 3),
     show: bool = True,
+    extent: tuple | None = None,
+    boxes=(),
 ):
     """Pictures side by side, with the legend of the classes in `legend` on the second; with
-    origin (row, col) the axes give rows and columns, for edits. Returns the figure when show
-    is False."""
+    origin (row, col) the axes give rows and columns, for edits, and with extent (left, right,
+    bottom, top) they span those numbers, as when a large scene is shown every k-th pixel.
+    boxes (row0, row1, col0, col1), in the numbers of the axes, are drawn in cyan. Returns the
+    figure when show is False."""
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
 
     fig, axes = plt.subplots(1, len(pictures), figsize=(size * len(pictures), size))
     axes = np.atleast_1d(axes)
     for ax, picture, name in zip(axes, pictures, titles, strict=True):
-        _draw(ax, picture, name, origin)
+        _draw(ax, picture, name, origin, extent)
+        for r0, r1, c0, c1 in boxes:
+            edge = Rectangle((c0, r0), c1 - c0, r1 - r0, fill=False, edgecolor="cyan", lw=1.5)
+            ax.add_patch(edge)
     _legend(axes[min(1, len(axes) - 1)], legend)
     if title:
         fig.suptitle(title, fontsize=11)

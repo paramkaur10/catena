@@ -62,6 +62,9 @@ def test_figures_open():
     assert len(fig.axes) == 4  # three pictures and the certainty's colour bar
     fig = viz.panels([picture, picture], ["a", "b"], origin=(100, 200), show=False)
     assert fig.axes[0].get_xlim()[0] == pytest.approx(199.5)  # axes count columns from 200
+    whole = (0, 300, 200, 0)  # every 10th pixel of a 200 x 300 scene, in its own numbers
+    fig = viz.panels([picture], ["a"], extent=whole, boxes=[(10, 50, 20, 80)], show=False)
+    assert fig.axes[0].get_xlim() == pytest.approx((0, 300)) and len(fig.axes[0].patches) == 1
     items = [(picture, picture, f"scene {k}") for k in range(3)]
     fig = viz.sheet(items, per_row=2, show=False)
     assert len(fig.axes) == 8  # two rows of two pairs, the last pair empty

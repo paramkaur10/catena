@@ -196,3 +196,77 @@ def test_figures(data):
     fig = d.zoom(s, 8, 10, size=12, show=False)
     assert fig.axes[0].get_ylim()[1] == pytest.approx(7.5)  # rows counted from 8
     assert len(d.compare(s, "ocm4", show=False).axes) == 3
+
+
+def made_up(draft: np.ndarray, rgb: np.ndarray | None = None) -> drafts.Scene:
+    """A scene in memory: its true colour brighter from left to right, and a draft."""
+    h, w = draft.shape
+    if rgb is None:
+        ramp = np.tile(np.linspace(1, 100, w, dtype=np.float32), (h, 1))
+        rgb = np.stack([ramp, ramp, ramp])
+    sure = np.ones((h, w), np.float32)
+    return drafts.Scene("IMH03_20261007T121948", {}, rgb, draft, sure)
+
+
+def test_rules():
+    draft = np.zeros((10, 10), np.uint8)
+    draft[:4] = 2  # thick cloud at the top
+    draft[4:7, :5] = 3  # shadow at the left
+    draft[:, -1] = viz.NO_LABEL
+    s = made_up(draft)
+    b = s.brightness
+    assert drafts.apply_steps(s, [("thin", 0.5)]) == []
+    thin = b[:4, :-1] < 0.5
+    assert (s.work[:4, :-1] == np.where(thin, 1, 2)).all()  # dim thick: thin
+    assert s.edits == [f"thin 0.5: {int(thin.sum())} pixels changed"]
+    drafts.apply_steps(s, [("cores", 0.5), ("trim", 0.5)])  # always from the draft again
+    assert (s.work[4:7, :5] == np.where(b[4:7, :5] > 0.5, 0, 3)).all()
+    assert (s.work[7:, :-1] == np.where(b[7:, :-1] > 0.5, 2, 0)).all()
+    boxes = drafts.apply_steps(s, [("set", 2, 1, (0.0, 0.2, 0.0, 0.5)), ("skip", (0.9, 1.0, 0, 1))])
+    assert boxes == [(0, 2, 0, 5), (9, 10, 0, 10)]
+    assert (s.work[:2, :5] == 1).all() and (s.work[:2, 5:-1] == 2).all()
+    assert (s.work[2:4, :-1] == 2).all()
+    assert (s.work[9] == viz.NO_LABEL).all() and "in rows 0-2, columns 0-5" in s.edits[0]
+    drafts.apply_steps(s, [("haze", 0.4, 0.8)])
+    expect = np.where(b >= 0.8, 2, np.where(b >= 0.4, 1, 0))
+    assert (s.work[:, :-1] == expect[:, :-1]).all() and (s.work[:, -1] == viz.NO_LABEL).all()
+    drafts.apply_steps(s, [("start", "other")], other=lambda name: np.full((10, 10), 3))
+    assert (s.work == 3).all() and s.label is None
+    rgb = s.rgb.copy()
+    rgb[2, 0] = 0  # no blue in the first row
+    framed = made_up(draft, rgb)
+    drafts.apply_steps(framed, [("frame",), ("set", 2, 1)])
+    assert (framed.work[0] == viz.NO_LABEL).all() and (framed.work[1:4, :-1] == 1).all()
+    with pytest.raises(ValueError, match="no step 'paint'"):
+        drafts.apply_steps(s, [("paint", 1)])
+    with pytest.raises(ValueError, match="other drafts"):
+        drafts.apply_steps(s, [("start", "ocm4_nirzeros")])
+
+
+def test_fix_remake_and_check(data):
+    d = drafts.Drafts(data, "iride_heo")
+    name = "IMH03_20261007T121948"
+    fixes = {name: ([("thin", 0.6)], "made up")}
+    s = d.fix(name, *fixes[name], who="tester", show=False)
+    assert (s.label[:8, :-1] == 1).all()  # its thick, darker than 0.6 here (0.57): thin
+    with rasterio.open(d.labels / name / "label.tif") as src:
+        assert "thin 0.6" in src.tags()["edits"] and src.tags()["note"] == "made up"
+    rows = {r["scene"]: r for r in d.check(fixes, show=False)}
+    assert rows[name]["differ"] == 0 and rows[name]["pixels"] == H * (W - 1)
+    assert rows[name]["changed"] == pytest.approx(0.25) and rows[name]["unlabelled"] == 0
+    assert rows["IMH02_20261009T133222"]["differ"] is None  # kept, no label.tif yet
+    d.keep_labels()
+    rows = {r["scene"]: r for r in d.check(fixes, show=False)}
+    assert rows["IMH02_20261009T133222"]["differ"] == 0 and rows[name]["role"] == "train"
+    other = {name: ([("thin", 0.6), ("set", 1, 0)], "another rule")}
+    assert {r["scene"]: r["differ"] for r in d.check(other, show=False)}[name] > 0
+    d.reviews["IMH02_20261009T133222"]["verdict"] = "all_clear"
+    clear, _, _ = d.remake("IMH02_20261009T133222", fixes)
+    assert (clear.work == np.where(clear.draft == viz.NO_LABEL, viz.NO_LABEL, 0)).all()
+    with pytest.raises(KeyError, match="no rules"):
+        d.remake(name, {})
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    fig = d.picture(s, [(0, 8, 0, 10)], show=False)
+    assert len(fig.axes) == 3 and len(fig.axes[0].patches) == 1
+    assert fig.axes[0].get_xlim() == pytest.approx((0, W))
