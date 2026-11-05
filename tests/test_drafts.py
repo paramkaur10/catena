@@ -131,12 +131,17 @@ def test_edit_and_save(data):
     assert s.edit(3, box=(16, 18, 0, 4)) == 8  # shadow in a box
     assert s.edit(0, below=0.5, where=2) == 8 * 16  # thick cloud it was unsure of
     assert s.edit(2, box=(0, H, W - 1, W)) == 0  # no data stays no data
+    s.rgb[:, :8] *= 2  # the top rows brighter than the rest: 0.74 against 0.36
+    assert s.brightness[:8, :-1].min() > 0.7 and s.brightness[8:, :-1].max() < 0.4
+    assert s.edit(1, where=2, brighter=0.5) == 8 * (W - 16 - 1)  # the bright thick that is left
+    assert s.edit(3, where=0, darker=0.5, box=(20, 22, 0, W)) == 2 * (W - 1)
     with pytest.raises(ValueError):
         s.edit(9)
     out = d.save_label(s, who="tester", note="made up")
     with rasterio.open(out) as src:
         assert np.array_equal(src.read(1), s.label) and src.tags()["labeller"] == "tester"
         assert "shadow (box (16, 18, 0, 4)): 8 pixels" in src.tags()["edits"]
+        assert "thin (where 2, brightness above 0.5)" in src.tags()["edits"]
     assert s.edits == [] and d.has_label(s.name)
     again = d.scene(s.name)
     assert np.array_equal(again.work, s.label)  # the saved label is now the working one

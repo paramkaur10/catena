@@ -23,6 +23,9 @@ def test_stretch_and_overlay():
     assert np.allclose(drawn[0, 1], expected)  # thin cloud: yellow
     assert np.allclose(drawn[3, 1], 0.5 * picture[3, 1] + 0.4)  # no label: washed grey
     assert np.array_equal(drawn[:, 2:], picture[:, 2:])  # clear: as it was
+    assert drawn.max() <= 1.0
+    lifted = viz.stretch(rgb, gamma=0.5)
+    assert np.allclose(lifted[:, 1:], np.sqrt(picture[:, 1:])) and (lifted[:, 0] == 1).all()
 
 
 def test_codes_and_shares():

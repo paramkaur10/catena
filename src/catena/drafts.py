@@ -56,6 +56,7 @@ DECISIONS = ("scene", "role", "verdict", "use", "notes")  # set_review.py's inpu
 SHARES = ("valid", "clear", "thick", "thin", "shadow")  # drafts.csv's numbers
 CLASSES = "0 clear, 1 thin cloud, 2 thick cloud, 3 cloud shadow, 255 no label"
 CODES = (0, 1, 2, 3, viz.NO_LABEL)  # what a label may hold
+GAMMA = 0.5  # lifts the dark parts of the true colour: sea, shadow, thin cloud over sea
 
 
 def read_rows(path: Path) -> list[dict]:
@@ -156,15 +157,31 @@ class Scene:
 
     @cached_property
     def picture(self) -> np.ndarray:
-        """True colour, (H, W, 3) in 0..1 (a 2-98% stretch over the valid pixels)."""
-        return viz.stretch(self.rgb, self.valid)
+        """True colour, (H, W, 3) in 0..1: a 2-98% stretch over the valid pixels, then a gamma
+        of 0.5 that lifts the dark parts."""
+        return viz.stretch(self.rgb, self.valid, gamma=GAMMA)
 
-    def edit(self, to: int, box=None, where=None, below: float | None = None) -> int:
+    @cached_property
+    def brightness(self) -> np.ndarray:
+        """(H, W) the mean of the picture's red, green and blue: 0 the scene's darkest, 1 its
+        brightest, as seen in the true colour."""
+        return self.picture.mean(axis=-1)
+
+    def edit(
+        self,
+        to: int,
+        box=None,
+        where=None,
+        below: float | None = None,
+        brighter: float | None = None,
+        darker: float | None = None,
+    ) -> int:
         """Set pixels of the working label to class `to` (0 clear, 1 thin, 2 thick, 3 shadow,
-        255 no label): inside box = (row0, row1, col0, col1) if given, only where the working
-        label is `where` (a code or a list of codes) if given, only where OmniCloudMask's
-        certainty is below `below` if given, and never outside the image. Returns how many
-        pixels changed; nothing is saved until Drafts.save_label()."""
+        255 no label). Each condition given narrows where: inside box = (row0, row1, col0,
+        col1); where the working label is `where` (a code or a list of codes); where
+        OmniCloudMask's certainty is below `below`; where the brightness (0..1, as in the
+        true colour) is above `brighter` or below `darker`. Never outside the image. Returns
+        how many pixels changed; nothing is saved until Drafts.save_label()."""
         if to not in CODES:
             raise ValueError(f"class {to}: use one of {CODES}")
         hit = self.valid.copy()
@@ -177,13 +194,19 @@ class Scene:
             hit &= np.isin(self.work, np.atleast_1d(where))
         if below is not None:
             hit &= np.nan_to_num(self.sure, nan=1.0) < below
+        if brighter is not None:
+            hit &= self.brightness > brighter
+        if darker is not None:
+            hit &= self.brightness < darker
         changed = int((self.work[hit] != to).sum())
         self.work[hit] = to
         rules = [
             f"box {box}" if box is not None else "",
             f"where {where}" if where is not None else "",
+            f"certainty below {below}" if below is not None else "",
+            f"brightness above {brighter}" if brighter is not None else "",
+            f"brightness below {darker}" if darker is not None else "",
         ]
-        rules.append(f"certainty below {below}" if below is not None else "")
         rule = ", ".join(r for r in rules if r) or "everywhere"
         self.edits.append(f"{viz.NAMES.get(to, 'no label')} ({rule}): {changed} pixels")
         return changed
@@ -435,6 +458,7 @@ class Drafts:
         grid = grid_of(folder / f"{self.draft}.tif")
         rgb = np.round(np.moveaxis(scene.picture, -1, 0) * 254).astype(np.uint8)
         rgb[:, ~scene.valid] = viz.NO_LABEL
-        write(folder / "rgb.tif", rgb, grid, {"bands": "red, green, blue; 2-98% stretch"})
+        tags = {"bands": f"red, green, blue; 2-98% stretch, gamma {GAMMA}"}
+        write(folder / "rgb.tif", rgb, grid, tags)
         write(folder / "label_start.tif", scene.work, grid, {"classes": CLASSES})
         return folder / "rgb.tif", folder / "label_start.tif"

@@ -126,20 +126,24 @@ COMPARE = 'd.compare(s, "__OTHER__")'
 EDIT_TEXT = """\
 ## Correcting a scene here
 
-`s.edit(to, box=(row0, row1, col0, col1), where=..., below=...)` sets pixels of the working
-label to class `to` (0 clear, 1 thin, 2 thick, 3 shadow, 255 no label): only inside the box if
-one is given, only where the working label is `where` (a class or a list) if given, only where
-OmniCloudMask's certainty is below `below` if given. Look again with `d.show(s)` or `d.zoom`;
-nothing is saved until `d.save_label(s)`, which writes `label.tif` with the edits in its tags.
-To correct by hand instead, `d.export_for_editing(s)` writes `rgb.tif` and `label_start.tif`
-for QGIS; save the corrected file as `label.tif` in the scene's folder."""
+`s.edit(to, ...)` sets pixels of the working label to class `to` (0 clear, 1 thin, 2 thick,
+3 shadow, 255 no label). Each condition you add narrows where: `where=` the classes to change
+(one or a list), `box=(row0, row1, col0, col1)` read off the zoom axes, `below=` OmniCloudMask's
+certainty under this, `brighter=` or `darker=` the pixel's brightness in the true colour (0 the
+scene's darkest, 1 its brightest) above or under this. Look again with `d.show(s)` or
+`d.zoom(...)`; nothing is saved until `d.save_label(s)`, which writes `label.tif` with the edits
+in its tags. To start again, run the scene cell once more. To correct by hand instead,
+`d.export_for_editing(s)` writes `rgb.tif` and `label_start.tif` for QGIS; save the corrected
+file as `label.tif` in the scene's folder."""
 
 EDIT = """\
+# s.edit(1, where=2, darker=0.6)                      # dim "thick" you can see through: thin
+# s.edit(2, where=3, brighter=0.5)                    # "shadow" inside a bright cloud: thick
+# s.edit(0, where=3, brighter=0.3)                    # "shadow" that is not dark: clear
 # s.edit(0, where=1)                                  # all its thin cloud is clear ground
 # s.edit(0, box=(0, 800, 1200, 2000), where=[1, 2])   # no cloud in this box
-# s.edit(0, where=1, below=0.6)                       # thin cloud it was unsure of
 # d.show(s)
-# d.save_label(s, who="Param", note="thin cloud over bright desert removed")"""
+# d.save_label(s, who="Param", note="")"""
 
 DECIDE_TEXT = """\
 ## Verdicts

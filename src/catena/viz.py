@@ -37,11 +37,16 @@ def step(shape: tuple, longest: int = 1200) -> int:
 
 
 def stretch(
-    rgb: np.ndarray, valid: np.ndarray | None = None, low: float = 2.0, high: float = 98.0
+    rgb: np.ndarray,
+    valid: np.ndarray | None = None,
+    low: float = 2.0,
+    high: float = 98.0,
+    gamma: float = 1.0,
 ) -> np.ndarray:
     """Red, green and blue (3, H, W), in any units, as an (H, W, 3) picture in 0..1: the low
     and high percentiles of the valid pixels, all three bands together so the colours keep
-    their balance, become 0 and 1. Pixels outside `valid` (default: a band above 0) are white."""
+    their balance, become 0 and 1; a gamma below 1 then lifts the dark parts (dark sea, thin
+    cloud over it). Pixels outside `valid` (default: a band above 0) are white."""
     picture = np.moveaxis(np.asarray(rgb, np.float32), 0, -1)
     if valid is None:
         valid = np.isfinite(picture).all(axis=-1) & (picture > 0).any(axis=-1)
@@ -50,6 +55,8 @@ def stretch(
     else:
         lo, hi = 0.0, 1.0
     out = np.clip((picture - lo) / max(hi - lo, 1e-9), 0.0, 1.0)
+    if gamma != 1.0:
+        out **= gamma
     out[~valid] = 1.0
     return out
 
@@ -62,7 +69,7 @@ def overlay(picture: np.ndarray, label: np.ndarray, strength: float = STRENGTH) 
         out[hit] = (1 - strength) * out[hit] + strength * np.array(colour, np.float32)
     gone = label == NO_LABEL
     out[gone] = 0.5 * out[gone] + 0.4
-    return out
+    return np.clip(out, 0.0, 1.0, out=out)  # rounding can step a hair past 1
 
 
 def shares(label: np.ndarray) -> dict[str, float]:
