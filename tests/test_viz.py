@@ -65,3 +65,6 @@ def test_figures_open():
     items = [(picture, picture, f"scene {k}") for k in range(3)]
     fig = viz.sheet(items, per_row=2, show=False)
     assert len(fig.axes) == 8  # two rows of two pairs, the last pair empty
+    fig = viz.sheet(items[:1], per_row=1, legend=(4,), show=False)
+    texts = [t.get_text() for t in fig.axes[1].get_legend().get_texts()]
+    assert texts == ["cloud"]  # CloudPeru2's one cloud class

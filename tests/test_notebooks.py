@@ -15,6 +15,7 @@ NAMES = {
     "labels_cloudsen12plus.ipynb",
     "labels_l8_biome.ipynb",
     "labels_l7_irish.ipynb",
+    "labels_cloudperu2.ipynb",
 }
 
 

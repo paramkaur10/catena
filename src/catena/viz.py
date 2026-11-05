@@ -134,26 +134,29 @@ def panels(
     size: float = 4.5,
     title: str | None = None,
     origin: tuple | None = None,
+    legend: tuple = (1, 2, 3),
     show: bool = True,
 ):
-    """Pictures side by side, with the class legend on the second; with origin (row, col)
-    the axes give rows and columns, for edits. Returns the figure when show is False."""
+    """Pictures side by side, with the legend of the classes in `legend` on the second; with
+    origin (row, col) the axes give rows and columns, for edits. Returns the figure when show
+    is False."""
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(1, len(pictures), figsize=(size * len(pictures), size))
     axes = np.atleast_1d(axes)
     for ax, picture, name in zip(axes, pictures, titles, strict=True):
         _draw(ax, picture, name, origin)
-    _legend(axes[min(1, len(axes) - 1)])
+    _legend(axes[min(1, len(axes) - 1)], legend)
     if title:
         fig.suptitle(title, fontsize=11)
     fig.tight_layout()
     return _finish(fig, show)
 
 
-def sheet(items, per_row: int = 2, size: float = 3.6, show: bool = True):
+def sheet(items, per_row: int = 2, size: float = 3.6, legend: tuple = (1, 2, 3), show: bool = True):
     """Several scenes on one figure, `per_row` to a row: each item is (picture, drawn,
-    title), shown as the picture beside the same picture with its classes."""
+    title), shown as the picture beside the same picture with its classes; the legend lists
+    the classes in `legend`."""
     import matplotlib.pyplot as plt
 
     rows = max(1, -(-len(items) // per_row))
@@ -165,7 +168,7 @@ def sheet(items, per_row: int = 2, size: float = 3.6, show: bool = True):
         row, col = divmod(k, per_row)
         _draw(axes[row, 2 * col], picture, title)
         _draw(axes[row, 2 * col + 1], drawn, "")
-    _legend(axes[0, 1])
+    _legend(axes[0, 1], legend)
     fig.tight_layout()
     return _finish(fig, show)
 

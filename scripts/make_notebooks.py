@@ -1,6 +1,7 @@
 """Write the label notebooks into notebooks/: one review notebook per set of OmniCloudMask
 drafts (IRIDE HEO, IRIDE Eaglet II, Phi-sat-2), to check and correct them, and one example
-notebook per hand-labelled dataset (CloudSEN12+, L8 Biome, L7 Irish), to show their labels.
+notebook per hand-labelled dataset (CloudSEN12+, L8 Biome, L7 Irish, CloudPeru2), to show
+their labels.
 
     python scripts/make_notebooks.py [--out notebooks] [--force]
 
@@ -297,6 +298,49 @@ for scene in chosen[::3]:
     title = f"{scene.zone} {scene.name}, gains {scene.gains}\\n{viz.describe(label)}"
     items.append((picture, viz.overlay(picture, label), title))
 viz.sheet(items, per_row=2)""",
+    ),
+    "cloudperu2": (
+        """\
+# CloudPeru2: PeruSat-1 labels
+
+CloudPeru2 (Morales et al., 2019): PeruSat-1 images at 2.8 m, four bands (blue, green, red,
+near-infrared) as surface reflectance in 8 bits, cut into 512 x 512 patches, each with a cloud
+mask: cloud or not cloud, with no thickness and no shadow. Every image came 8 times (rotations
+and flips); one of each group of 8 is kept (2,800 of 22,400 patches), and 5% of the groups go
+to validation. Catena reads cloud as 4 (cloud of unknown thickness) and the rest as 5 (not
+cloud: clear or shadow), which the loss takes as either. Below, eight patches with 10-90%
+cloud, drawn with a fixed seed. Colours: cloud orange.""",
+        """\
+import csv
+import warnings
+from pathlib import Path
+
+import numpy as np
+import rasterio
+
+from catena import viz
+
+warnings.filterwarnings("ignore", category=rasterio.errors.NotGeoreferencedWarning)
+ROOT = Path("/root/catena_data/chips/cloudperu2")
+with open(ROOT / "index.csv", newline="") as f:
+    rows = list(csv.DictReader(f))
+cloudy = [r for r in rows if 0.1 <= float(r["cloud_frac"]) <= 0.9]
+cloudy = [r for r in cloudy if float(r["nodata_frac"]) < 0.2]
+print(len(rows), "patches;", len(cloudy), "with 10-90% cloud and under 20% without image")
+rng = np.random.default_rng(0)
+items = []
+for k in rng.choice(len(cloudy), 8, replace=False):
+    n = cloudy[k]["n"]
+    with rasterio.open(ROOT / "images" / f"{n}.tif") as src:
+        image = src.read().astype(np.float32)  # blue, green, red, near-infrared
+    with rasterio.open(ROOT / "masks" / f"{n}_Mask.tif") as src:
+        mask = src.read(1)
+    label = np.where(mask == 255, 4, 5).astype(np.uint8)  # cloud, not cloud
+    label[~image.any(axis=0)] = viz.NO_LABEL  # no image: no label
+    picture = viz.stretch(image[[2, 1, 0]], label != viz.NO_LABEL)
+    title = f"patch {n} ({cloudy[k]['split']})\\n{viz.describe(label)}"
+    items.append((picture, viz.overlay(picture, label), title))
+viz.sheet(items, per_row=2, legend=(4,))""",
     ),
 }
 
