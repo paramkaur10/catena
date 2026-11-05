@@ -1,5 +1,6 @@
 """The OmniCloudMask drafts of one dataset (scripts/ocm_prelabel.py), to review and correct
-in a notebook (notebooks/labelling_<dataset>.ipynb).
+in a notebook (notebooks/label_tools.ipynb; the record of how each dataset's labels were made
+is notebooks/labelling_<dataset>.ipynb).
 
     from catena import drafts, label_fixes
     d = drafts.Drafts(Path("/root/catena_data"), "iride_heo")   # or draft="ocm4_nirblue"
@@ -42,6 +43,7 @@ from __future__ import annotations
 
 import csv
 import datetime
+import io
 import zipfile
 from collections import Counter
 from dataclasses import dataclass, field
@@ -153,6 +155,17 @@ def write(path: Path, data: np.ndarray, grid: dict, tags: dict | None = None) ->
 
 def now() -> str:
     return datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+
+
+def png(fig) -> bytes:
+    """A matplotlib figure as PNG bytes; the figure is closed, so a notebook does not also
+    draw it at the end of the cell."""
+    import matplotlib.pyplot as plt
+
+    out = io.BytesIO()
+    fig.savefig(out, format="png")
+    plt.close(fig)
+    return out.getvalue()
 
 
 @dataclass
@@ -585,13 +598,15 @@ class Drafts:
             raise ValueError(f"{name}: a scene with verdict {verdict or 'none'!r} has no label")
         return scene, saved, self.apply(scene, steps)
 
-    def check(self, fixes: dict, show: bool = True) -> list[dict]:
+    def check(self, fixes: dict, show: bool = True, pictures: dict | None = None) -> list[dict]:
         """Every scene with a verdict of keep, all_clear or correct made again from its draft
         (remake) and compared with its label.tif. One row per scene: differ, the pixels that
         are not the same (0: the file is what the record makes; None: no label.tif); pixels,
         those labelled in both the draft and the label; changed, the share of them the review
         changed; unlabelled, the share of the draft's labelled pixels the review left without
-        a label. With show, each scene's picture."""
+        a label. With show, each scene's picture. Given a dict as pictures, the picture of
+        every scene the review changed goes into it as PNG bytes by scene name, to show after
+        the table (IPython.display.Image(data=...)); nothing is drawn on the way."""
         rows = []
         for name in self.names:
             review = self.reviews[name]
@@ -610,10 +625,12 @@ class Drafts:
                 "unlabelled": float((~both)[drafted].mean()) if drafted.any() else 0.0,
             }
             rows.append(row)
+            state = "no label.tif" if saved is None else f"{row['differ']:,} pixels differ"
+            title = f"{name} ({row['role']}, {row['verdict']}): {state}"
             if show:
-                state = "no label.tif" if saved is None else f"{row['differ']:,} pixels differ"
-                title = f"{name} ({row['role']}, {row['verdict']}): {state}"
                 self.picture(scene, boxes, title=title)
+            if pictures is not None and (scene.draft != scene.work)[drafted].any():
+                pictures[name] = png(self.picture(scene, boxes, title=title, show=False))
         return rows
 
     def export_for_editing(self, scene: Scene) -> tuple[Path, Path]:

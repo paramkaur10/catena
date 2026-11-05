@@ -270,3 +270,19 @@ def test_fix_remake_and_check(data):
     fig = d.picture(s, [(0, 8, 0, 10)], show=False)
     assert len(fig.axes) == 3 and len(fig.axes[0].patches) == 1
     assert fig.axes[0].get_xlim() == pytest.approx((0, W))
+
+
+def test_check_pictures(data):
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    d = drafts.Drafts(data, "iride_heo")
+    name = "IMH03_20261007T121948"
+    fixes = {name: ([("thin", 0.6)], "made up")}
+    d.fix(name, *fixes[name], show=False)
+    d.keep_labels()
+    figures, open_before = {}, matplotlib.pyplot.get_fignums()
+    rows = d.check(fixes, show=False, pictures=figures)
+    assert [r["differ"] for r in rows] == [0, 0]
+    assert list(figures) == [name]  # the kept scene is its draft: no picture
+    assert figures[name].startswith(b"\x89PNG")
+    assert matplotlib.pyplot.get_fignums() == open_before  # closed: drawn only once

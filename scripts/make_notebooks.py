@@ -1,12 +1,15 @@
 """Write the notebooks into notebooks/, without outputs (run them in Jupyter):
 
-  labelling_<dataset>.ipynb   how the labels of IRIDE HEO, IRIDE Eaglet II and Phi-sat-2 were
-                              made: the review, the rules of every corrected scene
-                              (catena.label_fixes), a check that makes every label again
-                              from its OmniCloudMask draft, and the tools to label new scenes
+  labelling_<dataset>.ipynb   the record of how the labels of IRIDE HEO, IRIDE Eaglet II and
+                              Phi-sat-2 were made: the review, the rules of every corrected
+                              scene (catena.label_fixes), a check that makes every label again
+                              from its OmniCloudMask draft, and pictures of what the review
+                              changed. Run All only reads.
   labels_<dataset>.ipynb      the labels themselves, as pictures: the three above and the
                               hand-labelled datasets CloudSEN12+, L8 Biome, L7 Irish and
                               CloudPeru2
+  label_tools.ipynb           the tools to label new scenes of the three; nothing is written
+                              until a switch in it is turned on
 
     python scripts/make_notebooks.py [--out notebooks] [--force]
 
@@ -96,7 +99,6 @@ from IPython.display import HTML, Image, display
 from catena import drafts, label_fixes, viz
 
 DATA = Path("/root/catena_data")
-REPO = Path.home() / "projects" / "catena"
 d = drafts.Drafts(DATA, "__DATASET__", draft="__DRAFT__")
 FIXES = label_fixes.FIXES["__DATASET__"]
 print(d)
@@ -125,11 +127,12 @@ CHECK_TEXT = """\
 Each reviewed scene's label made again from its draft, by its verdict and its rules, and
 compared with its `label.tif`. `differ` counts the pixels that are not the same: 0 means the
 file is exactly what the record makes. `changed` is the share of the labelled pixels the
-review changed from the draft, `unlabelled` the share it left without a label. The pictures
-show the true colour, the draft and the label, with the boxes of the rules in cyan."""
+review changed from the draft, `unlabelled` the share it left without a label. The check
+only reads: it writes nothing."""
 
 CHECK = """\
-rows = d.check(FIXES)
+figures = {}  # the pictures of the scenes the review changed, for the next cell
+rows = d.check(FIXES, show=False, pictures=figures)
 columns = ["scene", "role", "verdict", "differ", "pixels", "changed", "unlabelled"]
 display(HTML(viz.html_table(rows, columns)))
 for role in drafts.ROLES:
@@ -143,97 +146,151 @@ for role in drafts.ROLES:
             f"changed {changed:.1%} of their {pixels:,} labelled pixels"
         )"""
 
+CHANGES_TEXT = """\
+## What the review changed
+
+Every scene whose label differs from its draft: the true colour, the draft and the label,
+with the boxes of its rules in cyan. Scenes kept as drafted, and clear scenes whose draft was
+already all clear, have no picture here; all the labels are drawn in
+`labels___DATASET__.ipynb`."""
+
+CHANGES = """\
+print(f"{len(figures)} of {len(rows)} scenes changed by the review")
+for name, picture in figures.items():
+    display(Image(data=picture))"""
+
 REMAKE_TEXT = """\
 ## Writing the labels again
 
-After a rule changes in `catena/label_fixes.py`, set `WRITE = True` and run this cell: every
-corrected scene's `label.tif` is written again from its draft (the `all_clear` and `keep`
-scenes are made by `set_review.py` and `keep_labels()`, below). Then run the check again."""
+Only after a rule changes in `catena/label_fixes.py`: set `WRITE = True` and run this cell,
+and every corrected scene's `label.tif` is written again from its draft; then run the check
+again. With `WRITE = False`, as it is kept, the cell does nothing. New scenes are labelled in
+`label_tools.ipynb`."""
 
 REMAKE = """\
 WRITE = False
 if WRITE:
     for name, (steps, note) in FIXES.items():
-        d.fix(name, steps, note, who="Param")"""
+        d.fix(name, steps, note, who="Param", show=False)"""
 
-TOOLS_TEXT = """\
-# Tools for new scenes
+TOOLS_INTRO = (
+    """\
+# Labelling new scenes
 
-The review pages show every scene's true colour beside its draft."""
+The tools that reviewed and corrected the OmniCloudMask drafts of IRIDE HEO, IRIDE Eaglet II
+and Phi-sat-2; how each dataset's labels were made is recorded in `labelling_<dataset>.ipynb`.
+Nothing here writes a file until you turn on its switch: Run All only lists the scenes still
+to do.
+
+1. Draft the new products with `scripts/ocm_prelabel.py`.
+2. Put the dataset in `DATASET` and a scene in `NAME`, and run the cells: the scene, where
+   OmniCloudMask was least sure, and (Eaglet II) its other draft.
+3. Try rules in `STEPS` until the label is right (the steps are listed below).
+4. `WRITE = True` writes `label.tif`; then add the line it prints to `catena/label_fixes.py`.
+5. Give the scene its role and verdict in `decisions`; kept scenes get `label.tif` with
+   `KEEP = True`.
+6. Run the check in `labelling_<dataset>.ipynb`: the new label must show `differ` 0.
+
+"""
+    + COLOURS
+)
+
+TOOLS_SETUP = """\
+import subprocess
+import sys
+from pathlib import Path
+
+from IPython.display import HTML, Image, display
+
+from catena import drafts, viz
+
+DATA = Path("/root/catena_data")
+REPO = Path.home() / "projects" / "catena"
+DATASET = "iride_heo"  # or "iride_eaglet2", "phisat2"
+DRAFT = {"iride_heo": "ocm4", "iride_eaglet2": "ocm4_nirblue", "phisat2": "ocm4"}[DATASET]
+OTHER = {"iride_eaglet2": "ocm4_nirzeros"}.get(DATASET)  # the scene's other draft, if any
+d = drafts.Drafts(DATA, DATASET, draft=DRAFT)
+todo = [n for n in d.names if d.reviews[n].get("verdict") != "drop" and not d.has_label(n)]
+print(d)
+print(len(todo), "scenes without label.tif:", ", ".join(todo) or "none")
+display(HTML(d.html()))
+for step, meaning in drafts.STEPS.items():
+    print(f"{step:<6} {meaning}")"""
+
+PAGES_TEXT = """\
+## The review pages
+
+Every scene's true colour beside its draft, for a first look at new products."""
 
 PAGES = """\
-for page in d.pages():
-    display(Image(filename=str(page), width=1200))"""
+PAGES = False  # True: show them
+if PAGES:
+    for page in d.pages():
+        display(Image(filename=str(page), width=1200))"""
 
 SCENE_TEXT = """\
 ## One scene
 
-`todo` lists the scenes still to do (not reviewed, or to correct and without `label.tif`);
-`name` is the first of them, or put any scene's name from the table. Four pictures: the true
-colour, the draft, the working label (`label.tif` if the scene has one, else the draft) and
-how sure OmniCloudMask was (1 = sure)."""
+Four pictures: the true colour, the draft, the working label (`label.tif` if the scene has
+one, else the draft) and how sure OmniCloudMask was (1 = sure); then the windows of 400 x 400
+pixels where it was least sure, at full resolution, with rows and columns on the axes
+(`d.zoom(s, row, col, size)` shows any other window)."""
 
 SCENE = """\
-todo = [n for n in d.names if d.reviews[n].get("verdict") in ("", "correct")]
-todo = [n for n in todo if not d.has_label(n)]
-print(len(todo), "scenes to do:", ", ".join(todo))
-name = todo[0] if todo else d.names[0]
-s = d.scene(name)
-print(s.summary())
-d.show(s)"""
+NAME = ""  # a scene from the table above, for example one of todo
+s = d.scene(NAME) if NAME else None
+if s is None:
+    print("Put a scene's name in NAME, then run this cell and the ones below.")
+else:
+    print(s.summary())
+    d.show(s)
+    for row, col, sure in d.unsure(s, size=400, n=3):
+        print(f"rows {row}-{row + 400}, columns {col}-{col + 400}: mean certainty {sure:.2f}")
+        d.zoom(s, row, col, size=400)
+    if OTHER:
+        d.compare(s, OTHER)"""
 
-ZOOM_TEXT = """\
-## Closer: where OmniCloudMask was least sure
+RULES_TRY_TEXT = """\
+## Rules
 
-Windows of 400 x 400 pixels at full resolution. Their axes give rows and columns.
-`d.zoom(s, row, col, size)` shows any other window."""
+Steps applied to the draft in order (the list is printed above). Trying them changes nothing
+on disk."""
 
-ZOOM = """\
-for row, col, sure in d.unsure(s, size=400, n=3):
-    print(f"rows {row}-{row + 400}, columns {col}-{col + 400}: mean certainty {sure:.2f}")
-    d.zoom(s, row, col, size=400)"""
+RULES_TRY = """\
+STEPS = []  # for example [("cores", 0.85), ("trim", 0.3)]
+if s is not None and STEPS:
+    boxes = d.apply(s, STEPS)
+    print("; ".join(s.edits))
+    d.picture(s, boxes)"""
 
-COMPARE_TEXT = """\
-## The other draft
+WRITE_TEXT = """\
+## Writing the label
 
-The same scene drafted with the near-infrared input filled the other way."""
+`WRITE = True` writes the scene's `label.tif` from its draft and `STEPS`, with `NOTE` in its
+tags, and prints the line to add to `catena/label_fixes.py`. Set it back to `False` after."""
 
-COMPARE = 'd.compare(s, "__OTHER__")'
-
-FIX_TEXT = """\
-## Correcting a scene
-
-Try rules on the scene with `d.apply(s, steps)` and `d.picture(s, boxes)`; when they are
-right, `d.fix(name, steps, note, who=...)` writes `label.tif`. Then add the scene, its steps
-and the note to `catena/label_fixes.py`, so that the record stays complete and the check
-passes."""
-
-FIX = """\
-steps = [("cores", 0.85), ("trim", 0.3)]  # for example; the steps are in drafts.STEPS
-boxes = d.apply(s, steps)
-print("; ".join(s.edits))
-d.picture(s, boxes)
-# d.fix(s.name, steps, "what was wrong and what the rules do", who="Param")"""
+WRITE_LABEL = """\
+WRITE = False
+NOTE = ""  # what was wrong and what the rules do
+if WRITE and s is not None:
+    d.fix(NAME, STEPS, NOTE, who="Param")
+    print("add to catena/label_fixes.py:")
+    print(f"    {NAME!r}: ({STEPS!r}, {NOTE!r}),")"""
 
 DECIDE_TEXT = """\
 ## Verdicts
 
-One line per scene you decide on. This cell writes them to `review_<today>.csv`; the next one
-runs `scripts/set_review.py`, which puts them into `scenes.csv` (and makes `label.tif` for
-`all_clear` scenes)."""
+One line per scene decided: role `train`, `test` or `stress`; verdict `keep`, `all_clear`,
+`correct` or `drop`. With lines in `decisions`, this cell writes them to `review_<today>.csv`
+and runs `scripts/set_review.py`, which puts them into `scenes.csv` (and makes `label.tif`
+for `all_clear` scenes). With none, it does nothing."""
 
 DECIDE = """\
 decisions = [
-    # dict(scene=name, role="test", verdict="correct", notes=""),
+    # dict(scene=NAME, role="test", verdict="correct", notes=""),
 ]
-review = d.decide(decisions) if decisions else None
-print(review)"""
-
-SET_REVIEW = """\
-import subprocess
-import sys
-
-if review:
+if decisions:
+    review = d.decide(decisions)
     script = str(REPO / "scripts" / "set_review.py")
     command = [sys.executable, script, str(d.labels), str(review), "--who", "Param"]
     run = subprocess.run(command, capture_output=True, text=True)
@@ -244,10 +301,13 @@ print(d)"""
 KEEP_TEXT = """\
 ## Labels for the kept scenes
 
-`label.tif` from the draft for every scene marked `keep` that has none yet (an existing
-`label.tif` is never touched)."""
+`KEEP = True` makes `label.tif` from the draft for every scene marked `keep` that has none
+yet; an existing `label.tif` is never touched."""
 
-KEEP = 'print("label.tif made for:", d.keep_labels())'
+KEEP = """\
+KEEP = False
+if KEEP:
+    print("label.tif made for:", d.keep_labels())"""
 
 PICTURES_INTRO = (
     """\
@@ -491,36 +551,44 @@ def filler(dataset: str, spec: dict):
 
 
 def labelling(dataset: str, spec: dict) -> dict:
-    """The record of how a dataset's labels were made, and the tools to label new scenes."""
+    """The record of how a dataset's labels were made; Run All only reads."""
     fill = filler(dataset, spec)
-    cells = [
-        cell("markdown", fill(LABELLING_INTRO)),
-        cell("code", fill(LABELLING_SETUP)),
-        cell("markdown", RULES_TEXT),
-        cell("code", RULES),
-        cell("markdown", CHECK_TEXT),
-        cell("code", CHECK),
-        cell("markdown", REMAKE_TEXT),
-        cell("code", REMAKE),
-        cell("markdown", TOOLS_TEXT),
-        cell("code", PAGES),
-        cell("markdown", SCENE_TEXT),
-        cell("code", SCENE),
-        cell("markdown", ZOOM_TEXT),
-        cell("code", ZOOM),
-    ]
-    if spec["other"]:
-        cells += [cell("markdown", COMPARE_TEXT), cell("code", fill(COMPARE))]
-    cells += [
-        cell("markdown", FIX_TEXT),
-        cell("code", FIX),
-        cell("markdown", DECIDE_TEXT),
-        cell("code", DECIDE),
-        cell("code", SET_REVIEW),
-        cell("markdown", KEEP_TEXT),
-        cell("code", KEEP),
-    ]
-    return notebook(cells)
+    return notebook(
+        [
+            cell("markdown", fill(LABELLING_INTRO)),
+            cell("code", fill(LABELLING_SETUP)),
+            cell("markdown", RULES_TEXT),
+            cell("code", RULES),
+            cell("markdown", CHECK_TEXT),
+            cell("code", CHECK),
+            cell("markdown", fill(CHANGES_TEXT)),
+            cell("code", CHANGES),
+            cell("markdown", REMAKE_TEXT),
+            cell("code", REMAKE),
+        ]
+    )
+
+
+def tools() -> dict:
+    """The tools to label new scenes; nothing is written until a switch is turned on."""
+    return notebook(
+        [
+            cell("markdown", TOOLS_INTRO),
+            cell("code", TOOLS_SETUP),
+            cell("markdown", PAGES_TEXT),
+            cell("code", PAGES),
+            cell("markdown", SCENE_TEXT),
+            cell("code", SCENE),
+            cell("markdown", RULES_TRY_TEXT),
+            cell("code", RULES_TRY),
+            cell("markdown", WRITE_TEXT),
+            cell("code", WRITE_LABEL),
+            cell("markdown", DECIDE_TEXT),
+            cell("code", DECIDE),
+            cell("markdown", KEEP_TEXT),
+            cell("code", KEEP),
+        ]
+    )
 
 
 def pictures(dataset: str, spec: dict) -> dict:
@@ -538,6 +606,7 @@ def build() -> dict[str, dict]:
     books = {f"labelling_{k}.ipynb": labelling(k, spec) for k, spec in LABELLED.items()}
     books |= {f"labels_{k}.ipynb": pictures(k, spec) for k, spec in LABELLED.items()}
     books |= {f"labels_{k}.ipynb": example(*parts) for k, parts in EXAMPLES.items()}
+    books["label_tools.ipynb"] = tools()
     return books
 
 
