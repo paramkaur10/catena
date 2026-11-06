@@ -8,6 +8,9 @@
 #     SEEDS="1" bash scripts/big.sh               (only some seeds)
 #     OUT=/root/catena_data/runs/big2 bash scripts/big.sh --shares 0.25 0.25 0.25 0.25
 #                                                 (another folder; options for the training)
+#     OUT=/root/catena_data/runs/big2 SEEDS="3 4 5" bash scripts/big.sh \
+#         --q-weights 0.5 0.3 0.2 --faults 0.5    (the second run: sim with more 10 m and
+#                                                 with calibration faults; real as before)
 #
 # Each seed writes OUT/seed<N>/ (train.log, config.json, metrics.jsonl, last.pt, final.pt);
 # OUT/big.log says when each seed started, with which options, and how it ended. Start it

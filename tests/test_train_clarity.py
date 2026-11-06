@@ -217,6 +217,33 @@ def test_the_real_version_never_sees_a_camera(data):
             assert not np.array_equal(b["sim_image"], b["image"])  # through a camera
 
 
+def test_the_sim_options_leave_the_real_version_alone(data):
+    plain = samples(data, shares=QUARTERS)
+    other = samples(data, shares=QUARTERS, q_weights=(1, 0, 0), faults=1.0)
+    for i in range(0, 240, 4):
+        a, b = plain[i], other[i]
+        for key in ("image", "card", "label", "real"):
+            assert np.array_equal(a[key], b[key])  # the real version: the same either way
+        assert other.pixel_size(i) == 1 and not b["same"]  # 10 m; its own copy everywhere
+        assert b["sim_image"].shape == b["image"].shape
+        assert np.array_equal(b["sim_label"], b["label"])
+        assert np.array_equal(b["sim_card"], b["card"])  # a fault is not on the card
+        n = int(b["real"].sum())
+        assert not np.array_equal(b["sim_image"][:n], b["image"][:n])  # every sample faulty
+        assert (b["sim_image"][n:] == 0).all()
+    equal = samples(data, shares=QUARTERS, q_weights=(2, 2, 2))
+    sizes = [plain.pixel_size(i) for i in range(0, 400, 4)]
+    assert [equal.pixel_size(i) for i in range(0, 400, 4)] == sizes  # equal: the first run's
+    tens = samples(data, shares=QUARTERS, q_weights=(0.5, 0.3, 0.2))
+    many = [tens.pixel_size(i) for i in range(0, 4000, 4)]
+    assert 0.42 < many.count(1) / len(many) < 0.58 and set(many) == {1, 3, 5}
+    with pytest.raises(ValueError, match="q_weights"):
+        samples(data, q_weights=(1, 1))
+    some = samples(data, shares=(1, 0, 0, 0), q_weights=(1, 0, 0), p_s2=1.0, faults=0.5)
+    looks = [np.array_equal(some[i]["sim_image"], some[i]["image"]) for i in range(0, 160, 4)]
+    assert 0 < sum(looks) < len(looks)  # half the samples faulty, the others as delivered
+
+
 def test_going_on_draws_the_same_samples(data):
     whole, later = samples(data, shares=QUARTERS), samples(data, shares=QUARTERS, start=8)
     assert len(later) == len(whole) - 8
@@ -264,6 +291,22 @@ def test_a_short_run_stopped_and_gone_on_with(data, tmp_path):
             assert torch.allclose(ended["models"][v][key], value, atol=1e-5), (v, key)
     entries = [json.loads(x) for x in (parts / "metrics.jsonl").read_text().splitlines()]
     assert [e["step"] for e in entries if e["kind"] == "train"] == [2, 4]
+
+
+def test_a_short_run_with_the_sim_options(data, tmp_path):
+    options = ("--q-weights", "0.5", "0.3", "0.2", "--faults", "0.5", "--fault-nir", "0.3")
+    C.main(run_args(data, tmp_path / "run", *options))
+    config = json.loads((tmp_path / "run/config.json").read_text())
+    assert config["made_up_cameras"]["share_of_sentinel2"] == 0.7
+    assert config["made_up_cameras"]["pixel_shares"] == [0.5, 0.3, 0.2]
+    faults = config["calibration_faults"]
+    assert faults["share_of_samples"] == 0.5 and faults["nir_share_up_to"] == 0.3
+    assert faults["bands"]["heo"] == {"visible": [1, 2, 3], "nir": 7}
+    state = torch.load(tmp_path / "run/final.pt", map_location="cpu")
+    assert state["step"] == 4 and set(state["models"]) == set(C.VERSIONS)
+    for bad in (["--q-weights", "1", "-1", "0"], ["--faults", "1.5"], ["--fault-nir", "1"]):
+        with pytest.raises(SystemExit):
+            C.parse_args([str(tmp_path / "x"), *bad])
 
 
 def test_the_versions_part_on_sentinel2(data, tmp_path):

@@ -2,6 +2,7 @@
 
     python -m catena.train_clarity OUT [--data /root/catena_data] [--seed 0] [--steps 60000]
         [--shares 0.4 0.2 0.2 0.2] [--devices cuda:0 cuda:1]
+        [--q-weights 1 1 1] [--faults 0] [--fault-gain 0.3] [--fault-nir 0.4]
 
 Clarity reads, for each band, only what every product states (catena.descriptor.card): its
 wavelengths, surface or top-of-atmosphere reflectance, the band's pixel size against the
@@ -14,7 +15,13 @@ same order, with the same bands and gains:
          camera (catena.sim): 30 or 50 m pixels, or 10 m, with more blur and noise, fewer
          bits and a saturation from 0.25 to 1.6. These are the same Sentinel-2 windows and
          labels, processed: no new images and no new labels.
-So the two differ only in the made-up cameras.
+So the two differ only in the made-up cameras. Two options change the sim version only:
+  --q-weights  how often its Sentinel-2 samples get 10, 30 and 50 m pixels (default 1 1 1:
+               each a third; 0.5 0.3 0.2 gives 10 m half the time, so 70% are made up);
+  --faults     the share of its samples, from every satellite, given a calibration fault
+               that no product states (catena.sim.calibration_fault): up to --fault-nir of
+               near infrared leaking into each visible band, and every band's gain off by up
+               to --fault-gain, as IRIDE Eaglet II delivers its bands. Not on the card.
 
 Each batch comes from one satellite, drawn with --shares (Sentinel-2, Landsat 8, HEO,
 PeruSat-1); the data under DATA:
@@ -68,9 +75,16 @@ TOPS = (0.25, 1.6)  # the made-up cameras' saturation, in reflectance
 PERUSAT_GAIN = (0.7, 1.5)  # one gain per PeruSat-1 sample, drawn on a log scale
 N_BANDS = T.N_BANDS  # band slots: 13, Sentinel-2's count
 PLACE = 8  # the sim version's placeholder for a sample it sees as the real one does
+NIR_LEAK = {  # per satellite: the visible bands a fault mixes near infrared into, and the NIR
+    "sentinel2": ((0, 1, 2, 3), 7),  # B01-B04; B08
+    "landsat8": ((0, 1, 2, 3), 4),  # B1-B4; B5
+    "heo": ((1, 2, 3), 7),  # B01-B03; B07
+    "perusat1": ((0, 1, 2), 3),  # blue, green, red; nir
+}
 # what a resumed run must share with the run it goes on from
 SAME_ARGS = ("seed", "steps", "batch", "size", "landsat_size", "heo_size", "perusat_size")
 SAME_ARGS += ("shares", "p_s2", "widths", "stem", "lr", "weight_decay", "warmup", "hold_out")
+SAME_ARGS += ("q_weights", "faults", "fault_gain", "fault_nir")
 
 
 def pack(x: np.ndarray, d: np.ndarray, real: np.ndarray, label: np.ndarray) -> dict:
@@ -84,8 +98,9 @@ class Samples(Dataset):
 
     Each item holds the real version's image (13 slots, the kept bands first), card, band
     slots and label, and the sim version's image, card and label. same is True when the sim
-    version sees what the real one sees (every batch but Sentinel-2's); its own entries are
-    then small placeholders."""
+    version sees what the real one sees (every batch but Sentinel-2's, unless the sim
+    version gets faults); its own entries are then small placeholders. The real version's
+    samples do not depend on q_weights and faults: everything it sees is drawn first."""
 
     def __init__(
         self,
@@ -100,6 +115,10 @@ class Samples(Dataset):
         gain: float = 0.05,
         min_bands: int = 3,
         start: int = 0,
+        q_weights=None,
+        faults: float = 0.0,
+        fault_gain: float = 0.3,
+        fault_nir: float = 0.4,
     ) -> None:
         self.windows, self.batch, self.seed = windows, batch, seed
         self.data = {"landsat8": landsat, "heo": heo_windows, "perusat1": peru}
@@ -108,6 +127,22 @@ class Samples(Dataset):
             if share > 0 and name != "sentinel2" and self.data[name] is None:
                 raise ValueError(f"{name} has a share of the batches but no data")
         self.p_s2, self.gain, self.min_bands, self.start = p_s2, gain, min_bands, start
+        self.q_weights = None
+        if q_weights is not None:
+            w = np.asarray(q_weights, np.float64)
+            if len(w) != len(sim.Q_CHOICES) or (w < 0).any() or w.sum() <= 0:
+                raise ValueError(f"q_weights: one weight per pixel size {sim.Q_CHOICES}, >= 0")
+            if not np.allclose(w, w[0]):  # equal weights: the draw of the first big run
+                self.q_weights = w / w.sum()
+        self.faults, self.fault_gain, self.fault_nir = faults, fault_gain, fault_nir
+
+    def faulty(self, x: np.ndarray, source: str, rng: np.random.Generator) -> np.ndarray | None:
+        """Every band of a sample with a calibration fault, for the sim version, or None when
+        the sample draws none (faults is the chance of one)."""
+        if self.faults <= 0 or rng.random() >= self.faults:
+            return None
+        visible, nir = NIR_LEAK[source]
+        return sim.calibration_fault(x, visible, nir, rng, self.fault_gain, self.fault_nir)
 
     def __len__(self) -> int:
         return len(self.windows) - self.start
@@ -120,7 +155,7 @@ class Samples(Dataset):
     def pixel_size(self, i: int) -> int:
         """The q of the sim version's Sentinel-2 sample i, shared by its batch."""
         rng = np.random.default_rng([self.seed, 2, i // self.batch])
-        return int(rng.choice(sim.Q_CHOICES))
+        return int(rng.choice(sim.Q_CHOICES, p=self.q_weights))
 
     def bands(self, total: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
         """Which bands a sample keeps, and their gains."""
@@ -135,14 +170,21 @@ class Samples(Dataset):
         x, d, real, label = T.render(*scene, 1, keep, None, rng, gains)
         out = pack(x, d, real, label)
         q = self.pixel_size(i)  # everything the real version sees is drawn by now
-        if q > 1 or rng.random() >= self.p_s2:
-            _, camera = sim.imagine_camera(rng, len(keep), q, tops=TOPS)
-            x, d, _, label = T.render(*scene, q, keep, camera, rng, gains)
+        made_up = q > 1 or rng.random() >= self.p_s2
+        image = self.faulty(s["image"], "sentinel2", rng)
+        if made_up or image is not None:
+            image = s["image"] if image is None else image
+            camera = sim.imagine_camera(rng, len(keep), q, tops=TOPS)[1] if made_up else None
+            x, d, _, label = T.render(
+                image, s["label"], s["sun_zenith"], q, keep, camera, rng, gains
+            )
         return out | {"sim_image": x, "sim_card": desc.card(d), "sim_label": label, "same": False}
 
-    def as_delivered(self, x: np.ndarray, d: np.ndarray, label, rng) -> dict:
-        """A sample both versions see alike: turned at random, its bands in the first slots."""
-        turn = int(rng.integers(8))
+    def as_delivered(self, x: np.ndarray, d: np.ndarray, label, turn: int, sim_x=None) -> dict:
+        """A sample as its satellite delivered it: given a quarter turn or flip (turn, 0-7),
+        its bands in the first slots. Both versions see it alike, unless sim_x, the same bands
+        with a fault, is given (or the sim version gets faults at all: then it sees x as its
+        own copy)."""
         n, size = len(x), x.shape[-1]
         image = np.zeros((N_BANDS, size, size), np.float32)
         image[:n] = loader.dihedral(x, turn)
@@ -151,26 +193,44 @@ class Samples(Dataset):
         real = np.zeros(N_BANDS, bool)
         real[:n] = True
         out = pack(image, descs, real, loader.dihedral(label, turn).astype(np.int64))
-        return out | {
-            "sim_image": np.zeros((N_BANDS, PLACE, PLACE), np.float32),
-            "sim_card": out["card"],
-            "sim_label": np.zeros((PLACE, PLACE), np.int64),
-            "same": True,
-        }
+        if sim_x is None and self.faults <= 0:
+            return out | {
+                "sim_image": np.zeros((N_BANDS, PLACE, PLACE), np.float32),
+                "sim_card": out["card"],
+                "sim_label": np.zeros((PLACE, PLACE), np.int64),
+                "same": True,
+            }
+        own = image.copy()
+        if sim_x is not None:
+            own[:n] = loader.dihedral(sim_x, turn)
+        return (
+            out
+            | {"sim_image": own, "sim_card": out["card"], "sim_label": out["label"]}
+            | {"same": False}
+        )
+
+    def with_fault(self, rho: np.ndarray, source: str, keep, gains, rng) -> np.ndarray | None:
+        """The kept bands of a sample with a fault for the sim version, or None."""
+        bad = self.faulty(rho, source, rng)
+        return None if bad is None else bad[keep] * gains[:, None, None]
 
     def from_landsat8(self, rng: np.random.Generator) -> dict:
         data = self.data["landsat8"]
         scene, dn, label = data.draw(rng)  # clear is 5 in a scene without shadow labels
         keep, gains = self.bands(len(biome.BANDS), rng)
-        x = biome.reflectance(scene, dn)[keep] * gains[:, None, None]
-        return self.as_delivered(x, data.cards[scene.name][keep], label, rng)
+        rho = biome.reflectance(scene, dn)
+        x, turn = rho[keep] * gains[:, None, None], int(rng.integers(8))
+        sim_x = self.with_fault(rho, "landsat8", keep, gains, rng)  # drawn after the real's
+        return self.as_delivered(x, data.cards[scene.name][keep], label, turn, sim_x)
 
     def from_heo(self, rng: np.random.Generator) -> dict:
         data = self.data["heo"]
         _, dn, label = data.draw(rng)
         keep, gains = self.bands(len(heo.BANDS), rng)
-        x = heo.reflectance(dn)[keep] * gains[:, None, None]
-        return self.as_delivered(x, data.card[keep], label, rng)
+        rho = heo.reflectance(dn)
+        x, turn = rho[keep] * gains[:, None, None], int(rng.integers(8))
+        sim_x = self.with_fault(rho, "heo", keep, gains, rng)
+        return self.as_delivered(x, data.card[keep], label, turn, sim_x)
 
     def from_perusat1(self, rng: np.random.Generator) -> dict:
         data = self.data["perusat1"]
@@ -178,8 +238,10 @@ class Samples(Dataset):
         keep, gains = self.bands(len(perusat.BANDS), rng)
         low, high = (math.log(g) for g in PERUSAT_GAIN)
         gains = gains * math.exp(rng.uniform(low, high))  # one more gain for the whole sample
-        x = perusat.reflectance(dn)[keep] * gains[:, None, None]
-        return self.as_delivered(x, data.card[keep], label, rng)
+        rho = perusat.reflectance(dn)
+        x, turn = rho[keep] * gains[:, None, None], int(rng.integers(8))
+        sim_x = self.with_fault(rho, "perusat1", keep, gains, rng)
+        return self.as_delivered(x, data.card[keep], label, turn, sim_x)
 
     def __getitem__(self, j: int) -> dict:
         i = self.start + j
@@ -330,6 +392,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--warmup", type=int, default=1000)
     p.add_argument("--clip", type=float, default=1.0)
     p.add_argument("--p-s2", type=float, default=0.6, help="sim: 10 m samples kept as delivered")
+    p.add_argument(
+        "--q-weights",
+        type=float,
+        nargs=3,
+        default=[1.0, 1.0, 1.0],
+        metavar=("W10", "W30", "W50"),
+        help="sim: how often its Sentinel-2 samples get 10, 30 and 50 m pixels",
+    )
+    p.add_argument("--faults", type=float, default=0.0, help="sim: share of samples with a fault")
+    p.add_argument("--fault-gain", type=float, default=0.3, help="a fault's gains: within 1+-x")
+    p.add_argument("--fault-nir", type=float, default=0.4, help="a fault's near infrared: up to")
     p.add_argument("--widths", type=int, nargs=4, default=[32, 64, 128, 256])
     p.add_argument("--stem", type=int, default=16)
     p.add_argument("--log-every", type=int, default=100)
@@ -346,6 +419,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             p.error(f"--{name.replace('_', '-')} must be a multiple of 8")
     if min(args.shares) < 0 or sum(args.shares) <= 0 or args.shares[0] <= 0:
         p.error("--shares: none below 0, and Sentinel-2 above 0 (it carries the validation)")
+    if min(args.q_weights) < 0 or sum(args.q_weights) <= 0:
+        p.error("--q-weights: none below 0, not all 0")
+    if not 0 <= args.faults <= 1 or args.fault_gain < 0 or not 0 <= args.fault_nir < 1:
+        p.error("--faults within 0 and 1, --fault-gain from 0, --fault-nir within 0 and 1")
     return args
 
 
@@ -396,6 +473,8 @@ def main(argv: list[str] | None = None) -> None:
     rows = breakdown(args, windows, data)
 
     arguments = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+    weights_q = np.asarray(args.q_weights, np.float64) / float(np.sum(args.q_weights))
+    at_10m = float(weights_q[sim.Q_CHOICES.index(1)])
     step, last = 0, args.out / "last.pt"
     if last.exists():  # going on after a stop
         state = torch.load(last, map_location="cpu")
@@ -430,9 +509,17 @@ def main(argv: list[str] | None = None) -> None:
             "sources": rows,
             "made_up_cameras": {
                 "version": "sim",
-                "share_of_sentinel2": round(1 - args.p_s2 / len(sim.Q_CHOICES), 4),
+                "share_of_sentinel2": round(1 - args.p_s2 * at_10m, 4),
                 "pixel_m": [sim.GRID_M * q for q in sim.Q_CHOICES],
+                "pixel_shares": [round(float(w), 4) for w in weights_q],
                 "saturation": list(TOPS),
+            },
+            "calibration_faults": {
+                "version": "sim",
+                "share_of_samples": args.faults,
+                "gain_within": args.fault_gain,
+                "nir_share_up_to": args.fault_nir,
+                "bands": {k: {"visible": list(v), "nir": n} for k, (v, n) in NIR_LEAK.items()},
             },
             "landsat_scenes": [s.name for s in data["landsat8"].scenes] if data["landsat8"] else [],
             "heo_scenes": [s.name for s in data["heo"].scenes] if data["heo"] else [],
@@ -451,6 +538,10 @@ def main(argv: list[str] | None = None) -> None:
         shares=args.shares,
         p_s2=args.p_s2,
         start=step * args.batch,
+        q_weights=args.q_weights,
+        faults=args.faults,
+        fault_gain=args.fault_gain,
+        fault_nir=args.fault_nir,
     )
     val_data = T.ValSamples(loader.GridWindows(s2, "validation", size=args.size), args.val_windows)
     pin = any(dev.type == "cuda" for dev in devices.values())
@@ -485,11 +576,19 @@ def main(argv: list[str] | None = None) -> None:
             f"  {r['source']:<10}{r['data']:<52}{r['pixel_m']:>5g} m{r['bands']:>7}"
             f"{r['share']:>7.0%}  {r['labels']}"
         )
+    pixel = "/".join(f"{w:.0%}" for w in weights_q)
     print(
         f"  made-up cameras: sim only, {config['made_up_cameras']['share_of_sentinel2']:.0%} of "
-        f"the Sentinel-2 samples, saturation {TOPS[0]}-{TOPS[1]}",
+        f"the Sentinel-2 samples (pixels 10/30/50 m: {pixel}), saturation {TOPS[0]}-{TOPS[1]}",
         flush=True,
     )
+    if args.faults > 0:
+        print(
+            f"  calibration faults: sim only, {args.faults:.0%} of every satellite's samples: "
+            f"up to {args.fault_nir:.0%} near infrared in the visible bands, gains within "
+            f"+-{args.fault_gain:.0%}; not on the card",
+            flush=True,
+        )
     if step:
         print(f"going on from step {step:,} (last.pt)", flush=True)
 

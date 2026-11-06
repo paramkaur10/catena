@@ -5,6 +5,8 @@ made it, with an honest descriptor of what that camera got.
     fixed_camera()      one chain for every band, for validation and tests
     simulate()          that camera's image of a chip, band by band, and its descriptors
     downsample_label()  the label moved onto the camera's grid
+    calibration_fault() a fault no product states: near infrared leaking into the visible
+                        bands, and gains off band by band
 
 Three rules keep it honest. Only worse: blur and noise are added, never removed, so a
 camera asked to be sharper or quieter than Sentinel-2 gets Sentinel-2's own. The
@@ -60,6 +62,29 @@ def imagine_camera(
         for _ in range(n_bands)
     ]
     return q, bands
+
+
+def calibration_fault(
+    x: np.ndarray,
+    visible,
+    nir: int,
+    rng: np.random.Generator,
+    gain: float = 0.3,
+    nir_share: float = 0.4,
+) -> np.ndarray:
+    """x (bands, H, W), reflectance, with a calibration fault that no product states, as new
+    satellites have. IRIDE Eaglet II's three bands pick up 17-36% of near infrared, and its
+    delivered colour balance is off by up to 15% (both measured against Sentinel-2 for its
+    L1D processor). Here each band in `visible` becomes a mix of itself and a share of band
+    `nir`, drawn up to nir_share: an out-of-band response. Then every band is scaled by its
+    own gain, drawn on a log scale between 1 / (1 + gain) and 1 + gain. No data (0 in every
+    band) stays 0."""
+    out = np.array(x, np.float32, copy=True)
+    for k, share in zip(visible, rng.uniform(0.0, nir_share, len(visible)), strict=True):
+        out[k] = (1.0 - share) * out[k] + share * x[nir]
+    bound = math.log1p(gain)
+    gains = np.exp(rng.uniform(-bound, bound, len(out))).astype(np.float32)
+    return out * gains[:, None, None]
 
 
 def fixed_camera(

@@ -11,7 +11,13 @@ import pytest
 
 from catena.descriptor import FIELDS, bands_from_spec, blind, describe, hide
 from catena.sensors.physics import mtf_from_sigma, noise_from_snr, sigma_from_mtf
-from catena.sim import downsample_label, fixed_camera, imagine_camera, simulate
+from catena.sim import (
+    calibration_fault,
+    downsample_label,
+    fixed_camera,
+    imagine_camera,
+    simulate,
+)
 
 S2_SIGMA = sigma_from_mtf(0.25)
 S2_AB = noise_from_snr(142, 0.224, 0.7)
@@ -169,3 +175,25 @@ def test_sentinel2_from_its_spec():
     swir = bands["B11"]
     assert swir.gsd_m == 20 and not swir.mtf_known
     assert swir.sigma_px(10) == pytest.approx(2 * sigma_from_mtf(0.25))
+
+
+def test_calibration_fault():
+    x = np.zeros((4, 3, 3), np.float32)
+    x[0], x[1], x[2], x[3] = 0.1, 0.2, 0.05, 0.4  # blue, green, red, near infrared
+    x[:, 0, 0] = 0.0  # no data
+    rng = np.random.default_rng(7)
+    out = calibration_fault(x, (0, 1, 2), 3, rng, gain=0.3, nir_share=0.4)
+    again = np.random.default_rng(7)
+    shares = again.uniform(0.0, 0.4, 3)
+    bound = math.log1p(0.3)
+    gains = np.exp(again.uniform(-bound, bound, 4))
+    for k in range(3):  # visible: mixed with near infrared, then scaled
+        mixed = (1 - shares[k]) * x[k, 1, 1] + shares[k] * 0.4
+        assert out[k, 1, 1] == pytest.approx(mixed * gains[k], rel=1e-5)
+    assert out[3, 1, 1] == pytest.approx(0.4 * gains[3], rel=1e-5)  # near infrared: scaled only
+    assert (out[:, 0, 0] == 0).all() and out.dtype == np.float32 and x[0, 1, 1] == 0.1
+    many = np.stack([calibration_fault(x, (0,), 3, rng)[:, 1, 1] / x[:, 1, 1] for _ in range(500)])
+    assert 1 / 1.3 - 1e-6 <= many[:, 1:].min() and many[:, 1:].max() <= 1.3 + 1e-6
+    assert many[:, 0].max() <= 1.3 * (0.6 + 0.4 * 4) + 1e-6  # blue: up to 40% of a 4x brighter NIR
+    none = calibration_fault(x, (0, 1, 2), 3, rng, gain=0.0, nir_share=0.0)
+    assert np.allclose(none, x)
