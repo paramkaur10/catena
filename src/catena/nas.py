@@ -38,6 +38,14 @@ architecture code, parameters and megabytes, fitness, the scores per camera, mil
 backups/) and population.log. Run again with the same OUT, it goes on from the last
 population saved, without training again the candidates already scored. At the end it prints
 the best trunks and the command that trains the best two end to end (train_clarity's nas arms).
+
+A candidate that fails (out of memory, an error) scores 0 and the search goes on. A fault on
+the GPU (CUDA) is different: it breaks the process's hold on the GPU for good, or takes the
+process down at once, so the process stops (exit 3, or the fault's own). trying.json, written
+before each candidate trains, names the one it was on. Started again (scripts/search.sh does
+so), the search trains that candidate once more; if it stops on it a second time (TRIES), it
+scores the candidate 0, leaves it out and goes on. Each failed candidate gets a line in
+search.jsonl with its reason (failed), and is never trained again.
 """
 
 from __future__ import annotations
@@ -69,6 +77,8 @@ from catena.data import loader
 from catena.model import BandEncoder, count_parameters
 
 CONFIG = Path(__file__).with_name("pynas.ini")
+TRYING = "trying.json"  # the candidate being trained, while it is
+TRIES = 2  # a candidate the process stopped on this many times is left out
 CLASSES = 4
 BYTES = 2  # a parameter at float16
 TILE = 240  # the speed is measured on tiles of this size
@@ -247,6 +257,17 @@ class Trainer:
             worker_init_fn=T.quiet,
         )
 
+    def failed(self, generation: int, index: int, code: str, net: nn.Module, why: str) -> dict:
+        """A candidate that could not be trained: fitness 0, a line in search.jsonl."""
+        parameters = count_parameters(net)
+        result = {"generation": generation, "index": index, "code": code, "steps": 0}
+        result |= {"parameters": parameters, "mb": round(BYTES * parameters / 1e6, 3)}
+        result |= {"fitness": 0.0, "ms_per_tile": None, "per_camera": {}, "failed": why}
+        with open(self.record, "a") as f:
+            f.write(json.dumps(result) + "\n")
+        print(f"  gen {generation} #{index}: {why}; scored 0", flush=True)
+        return result
+
     @torch.no_grad()
     def speed(self, net: nn.Module, bands: int = 4, batch: int = 8) -> float:
         """Milliseconds per 240 px tile of `bands` bands, on the device, after a warm-up."""
@@ -382,7 +403,29 @@ def search_class():
             individual.architecture = code  # PyNAS leaves it as first drawn
             torch.manual_seed(self.args.seed)  # every trunk from the same start
             net, _ = self.build_model(individual.parsed_layers)
-            result = self.trainer(net, self.generation, idx, code)
+            marker = Path(self.save_directory) / TRYING
+            before = json.loads(marker.read_text()) if marker.exists() else {}
+            again = (before.get("generation"), before.get("index")) == (self.generation, idx)
+            tries = 1 + int(before.get("tries", 1)) if again else 1  # the last run stopped on it
+            trying = {"generation": self.generation, "index": idx, "code": code, "tries": tries}
+            marker.write_text(json.dumps(trying))
+            why = None
+            try:
+                result = self.trainer(net, self.generation, idx, code)
+            except torch.OutOfMemoryError:
+                why = "out of memory"
+            except Exception as error:
+                if "CUDA" in str(error) or type(error).__name__ == "AcceleratorError":
+                    print(
+                        f"  gen {self.generation} #{idx}: a fault on the GPU: {error}", flush=True
+                    )
+                    os._exit(3)  # the process cannot use the GPU again; trying.json stays
+                why = f"{type(error).__name__}: {error}"[:300]
+            if why:  # out of the except clause, the error has let go of its tensors
+                net.to("cpu")
+                torch.cuda.empty_cache()
+                result = self.trainer.failed(self.generation, idx, code, net, why)
+            marker.unlink(missing_ok=True)
             individual.fitness = float(result["fitness"])
             individual.metric = result.get("cloud_ba")
             individual.fps = 1000.0 / result["ms_per_tile"] if result["ms_per_tile"] else None
@@ -390,7 +433,7 @@ def search_class():
             if self.df is None or len(self.df) != len(self.population):
                 self._update_df()
             for column, value in (
-                ("Fitness", individual.fitness),
+                ("Fitness", individual.fitness or 1e-9),  # 0 tells PyNAS "not trained yet"
                 ("Metric", individual.metric),
                 ("FPS", individual.fps),
                 ("MB", result["mb"]),
@@ -410,10 +453,45 @@ def last_generation(out: Path) -> int | None:
     return max(found) if found else None
 
 
+def leave_out(pop, out: Path, record: Path, tries: int = TRIES) -> None:
+    """The candidate the last run stopped on (trying.json, of this generation): the first
+    time, it is trained once more; after `tries` times, it is scored 0, marked scored and left
+    out, since it takes the process down."""
+    marker = out / TRYING
+    if not marker.exists():
+        return
+    found = json.loads(marker.read_text())
+    idx = found.get("index", -1)
+    if found.get("generation") != pop.generation or not 0 <= idx < len(pop.population):
+        marker.unlink()
+        return
+    if int(found.get("tries", 1)) < tries:  # run_precision_suite counts the tries
+        print(f"  gen {pop.generation} #{idx}: the last run stopped on it; once more", flush=True)
+        return
+    marker.unlink()
+    individual = pop.population[idx]
+    individual.fitness = 0.0
+    if pop.df is None or len(pop.df) != len(pop.population):
+        pop._update_df()
+    pop.df.loc[idx, "Fitness"] = 1e-9  # 0 tells PyNAS "not trained yet"
+    pop.df.loc[idx, "Code"] = found.get("code", "")
+    pop.save_dataframe()
+    pop.save_population()
+    line = found | {"steps": 0, "fitness": 0.0, "ms_per_tile": None, "per_camera": {}}
+    if getattr(individual, "model_size", None):
+        line["parameters"] = int(individual.model_size)
+        line["mb"] = round(BYTES * line["parameters"] / 1e6, 3)
+    line["failed"] = "it took the process down (a fault on the GPU)"
+    with open(record, "a") as f:
+        f.write(json.dumps(line) + "\n")
+    print(f"  gen {pop.generation} #{idx}: {line['failed']}; scored 0, left out", flush=True)
+
+
 def best(record: Path, n: int = 10) -> list[dict]:
     """The best trunks of search.jsonl: each code once, with its mean fitness over the times it
     was trained (the kept best are trained again each generation)."""
     rows = [json.loads(line) for line in record.read_text().splitlines() if line.strip()]
+    rows = [r for r in rows if not r.get("failed")]
     by_code: dict[str, list[dict]] = {}
     for r in rows:
         by_code.setdefault(r["code"], []).append(r)
@@ -486,7 +564,7 @@ def main(argv: list[str] | None = None) -> None:
     np.random.seed(args.seed)  # noqa: NPY002  (PyNAS draws from numpy's global generator)
     torch.manual_seed(args.seed)
     device = torch.device(args.device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = False  # every trunk has new shapes: no tuning for each
     head = load_head(args.head, args.arm)
     size = smallest(args)
     record = args.out / "search.jsonl"
@@ -522,6 +600,7 @@ def main(argv: list[str] | None = None) -> None:
     else:  # going on: PyNAS skips the candidates its dataframe has a fitness for
         pop.population, pop.df, pop.generation = pop.load_population(g), pop.load_dataframe(g), g
         print(f"going on from generation {g}", flush=True)
+        leave_out(pop, args.out, record)
     while True:
         pop.train_generation(task="segmentation", lr=args.lr, epochs=0, batch_size=args.batch)
         if pop.generation + 1 >= args.generations:

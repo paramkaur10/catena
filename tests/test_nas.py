@@ -1,7 +1,8 @@
 """The architecture search behind the descriptor head: PyNAS's trunks behind a band encoder,
 for any window size and with GroupNorm; a run's head, kept as it is; crossover that leaves the
-parents alone; a tiny search on made-up data (CPU), gone on with; and a trunk it finds,
-trained as an arm and tested. Needs PyNAS (py-q-nas) installed: skipped without it."""
+parents alone; a tiny search on made-up data (CPU), gone on with, and its candidates that fail
+(out of memory; a fault on the GPU, tried again, then left out); and a trunk it finds, trained
+as an arm and tested. Needs PyNAS (py-q-nas) installed: skipped without it."""
 
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("rasterio")
 pytest.importorskip("pynas")
+pd = pytest.importorskip("pandas")
 
 from test_train_clarity import data, run_args  # noqa: E402, F401  (the made-up DATA folder)
 
@@ -79,7 +81,7 @@ def test_crossover_leaves_the_parents_alone():
     assert pynas.population.single_point_crossover is nas.crossover
 
 
-def test_a_tiny_search(data, tmp_path):  # noqa: F811
+def test_a_tiny_search(data, tmp_path, monkeypatch):  # noqa: F811
     run = tmp_path / "run"
     C.main(run_args(data, run))  # a finished run, real and sim, to take the head from
     out = tmp_path / "search"
@@ -105,6 +107,65 @@ def test_a_tiny_search(data, tmp_path):  # noqa: F811
     top = nas.best(out / "search.jsonl", 3)
     assert len(top) <= 3 and top == sorted(top, key=lambda r: r["fitness"], reverse=True)
     assert all(np.isfinite(r["fitness"]) for r in top)
+
+    # candidates that fail, in the last generation: each made "not trained yet" in turn
+    frame, marker = out / "src/df_population_1.pkl", out / nas.TRYING
+
+    def lines():
+        return [json.loads(x) for x in (out / "search.jsonl").read_text().splitlines()]
+
+    def not_trained(idx):
+        df = pd.read_pickle(frame)
+        df.loc[idx, "Fitness"] = np.nan
+        df.to_pickle(frame)
+
+    def failing(error):
+        def train(self, net, generation, index, code):
+            raise error
+
+        return train
+
+    def stop(code):
+        raise SystemExit(code)
+
+    fault = RuntimeError("CUDA error: unspecified launch failure")
+    not_trained(0)  # out of memory: scored 0, and the search goes on
+    with monkeypatch.context() as m:
+        m.setattr(nas.Trainer, "__call__", failing(torch.OutOfMemoryError("out of memory")))
+        nas.main(args)
+    assert lines()[-1]["index"] == 0 and lines()[-1]["failed"] == "out of memory"
+    assert len(lines()) == 9 and not marker.exists()
+    not_trained(1)  # a fault on the GPU: the process stops, then trains it once more
+    with monkeypatch.context() as m:
+        m.setattr(nas.Trainer, "__call__", failing(fault))
+        m.setattr(nas.os, "_exit", stop)
+        with pytest.raises(SystemExit):
+            nas.main(args)
+    assert json.loads(marker.read_text()) | {"code": ""} == {
+        "generation": 1,
+        "index": 1,
+        "code": "",
+        "tries": 1,
+    }
+    nas.main(args)
+    assert len(lines()) == 10 and lines()[-1]["index"] == 1 and "failed" not in lines()[-1]
+    assert not marker.exists()
+    not_trained(2)  # stopped on twice: left out, not trained again
+    with monkeypatch.context() as m:
+        m.setattr(nas.Trainer, "__call__", failing(fault))
+        m.setattr(nas.os, "_exit", stop)
+        for _ in range(2):
+            with pytest.raises(SystemExit):
+                nas.main(args)
+    assert json.loads(marker.read_text())["tries"] == 2
+    nas.main(args)
+    assert len(lines()) == 11 and lines()[-1]["index"] == 2 and lines()[-1]["steps"] == 0
+    assert lines()[-1]["failed"].startswith("it took the process down") and not marker.exists()
+    fitness = pd.read_pickle(frame)["Fitness"]
+    assert fitness[0] == fitness[2] == pytest.approx(1e-9) and fitness.notna().all()
+    nas.main(args)  # nothing left to train
+    assert len(lines()) == 11
+    assert all(r["code"] for r in nas.best(out / "search.jsonl"))
 
 
 def test_a_found_trunk_trained_and_tested(data, tmp_path):  # noqa: F811
