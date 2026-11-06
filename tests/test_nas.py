@@ -81,6 +81,23 @@ def test_crossover_leaves_the_parents_alone():
     assert pynas.population.single_point_crossover is nas.crossover
 
 
+def test_the_best_trunks_of_several_searches(tmp_path):
+    def row(code, fitness, **more):
+        known = {"parameters": 1, "mb": 0.1, "ms_per_tile": 1}
+        return {"code": code, "fitness": fitness} | known | more
+
+    def write(name, rows):
+        (tmp_path / name).write_text("".join(json.dumps(r) + "\n" for r in rows))
+        return tmp_path / name
+
+    a = write("a.jsonl", [row("A", 0.5), row("B", 0.7), row("B", 0.5), row("C", 0, failed="x")])
+    b = write("b.jsonl", [row("D", 0.65), row("A", 0.9)])
+    # by mean fitness: A 0.9 (b), D 0.65, B 0.6, A 0.5 (a); each code once; C failed
+    assert nas.top_codes([a, b, tmp_path / "missing.jsonl"]) == ["A", "D"]
+    assert nas.top_codes([a], 5) == ["B", "A"]
+    assert nas.top_codes([tmp_path / "missing.jsonl"]) == []
+
+
 def test_a_tiny_search(data, tmp_path, monkeypatch):  # noqa: F811
     run = tmp_path / "run"
     C.main(run_args(data, run))  # a finished run, real and sim, to take the head from

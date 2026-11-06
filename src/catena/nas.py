@@ -58,7 +58,9 @@ import math
 import os
 import platform
 import random
+import sys
 import time
+import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -419,6 +421,9 @@ def search_class():
                     print(
                         f"  gen {self.generation} #{idx}: a fault on the GPU: {error}", flush=True
                     )
+                    traceback.print_exc()  # where it surfaced, for the log
+                    sys.stdout.flush()
+                    sys.stderr.flush()
                     os._exit(3)  # the process cannot use the GPU again; trying.json stays
                 why = f"{type(error).__name__}: {error}"[:300]
             if why:  # out of the except clause, the error has let go of its tensors
@@ -512,6 +517,15 @@ def best(record: Path, n: int = 10) -> list[dict]:
             }
         )
     return sorted(out, key=lambda r: r["fitness"], reverse=True)[:n]
+
+
+def top_codes(records, n: int = 2) -> list[str]:
+    """The n best trunks of several searches (their search.jsonl; a missing one is skipped),
+    each code once, by its mean fitness (best). Searches trained alike only: a fitness after
+    2,000 steps is not one after 3,000."""
+    found = [row for record in map(Path, records) if record.exists() for row in best(record, 10**9)]
+    found.sort(key=lambda row: row["fitness"], reverse=True)
+    return list(dict.fromkeys(row["code"] for row in found))[:n]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
