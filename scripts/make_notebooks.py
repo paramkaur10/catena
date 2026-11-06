@@ -10,6 +10,9 @@
                               CloudPeru2
   label_tools.ipynb           the tools to label new scenes of the three; nothing is written
                               until a switch in it is turned on
+  results_<dataset>.ipynb     what Clarity and OmniCloudMask predicted, scene by scene, beside
+                              the true colour and the label, from the maps that
+                              catena.evaluate_clarity --maps keeps (catena.maps)
 
     python scripts/make_notebooks.py [--out notebooks] [--force]
 
@@ -517,6 +520,91 @@ viz.sheet(items, per_row=2, legend=(4,))""",
 }
 
 
+RESULTS = {  # dataset: (title, the test sets in its maps, where OmniCloudMask's classes come from)
+    "iride_heo": ("IRIDE HEO, test and stress scenes", ("heo_test", "heo_stress"), "drafts"),
+    "iride_eaglet2": ("IRIDE Eaglet II", ("eaglet2",), "drafts"),
+    "phisat2": ("Phi-sat-2", ("phisat2",), "drafts"),
+    "l7_irish": ("Landsat 7, L7 Irish pilot scenes", ("landsat7",), "run"),
+    "l8_biome": ("Landsat 8, L8 Biome pilot scenes", ("landsat8",), "run"),
+}
+
+RESULTS_INTRO = (
+    """\
+# What the networks predicted: __TITLE__
+
+Each scene drawn five times on its true colour (the review's stretch): the label, then
+OmniCloudMask, then Clarity real and Clarity sim, each the class most of its 3 seeds chose at
+the pixel. The titles give how much of the labelled pixels each one calls cloud (thin or
+thick), and its balanced accuracy of cloud against not cloud (0.5 is a coin toss, 1 perfect);
+the table gives the same numbers for every scene. Grey: no label.
+
+__SOURCE__
+
+The maps come from the evaluation of the big run, kept with `--maps`:
+
+```
+python -m catena.evaluate_clarity /root/catena_data/runs/big --tests B C D E --ocm \\
+    --maps /root/catena_data/runs/big/maps
+```
+
+"""
+    + COLOURS
+)
+
+SOURCES_NOTE = {
+    "drafts": (
+        "OmniCloudMask's classes are its drafts, which the labels were corrected from: where "
+        "the review kept a draft, OmniCloudMask agrees with the label by construction."
+    ),
+    "run": (
+        "OmniCloudMask ran on these scenes as it ran for the drafts (model 4.0 on red, green "
+        "and near infrared); the labels do not come from it, so the comparison is even."
+    ),
+}
+
+RESULTS_SETUP = """\
+from pathlib import Path
+
+from IPython.display import HTML, display
+
+from catena import maps, viz
+
+MAPS = Path("/root/catena_data/runs/big/maps")
+kept = [maps.Kept(MAPS, name) for name in __SETS__]
+for k in kept:
+    print(k)
+if not any(k.scenes for k in kept):
+    print("No maps yet: run the evaluation with --maps first (the command above).")"""
+
+RESULTS_TABLE = """\
+for k in kept:
+    if k.scenes:
+        print(k.name)
+        display(HTML(viz.html_table(k.table(), k.columns())))"""
+
+RESULTS_PICTURES = """\
+for k in kept:
+    for scene in k.scenes:
+        k.show(scene)"""
+
+
+def results(dataset: str, spec: tuple) -> dict:
+    """What the networks predicted on one dataset's scenes, from the kept maps."""
+    title, sets, source = spec
+    intro = RESULTS_INTRO.replace("__TITLE__", title)
+    intro = intro.replace("__SOURCE__", SOURCES_NOTE[source])
+    return notebook(
+        [
+            cell("markdown", intro),
+            cell("code", RESULTS_SETUP.replace("__SETS__", repr(sets))),
+            cell("markdown", "## Every scene in numbers"),
+            cell("code", RESULTS_TABLE),
+            cell("markdown", "## Every scene in pictures"),
+            cell("code", RESULTS_PICTURES),
+        ]
+    )
+
+
 def cell(kind: str, text: str) -> dict:
     lines = text.splitlines(keepends=True)
     if kind == "markdown":
@@ -607,6 +695,7 @@ def build() -> dict[str, dict]:
     books |= {f"labels_{k}.ipynb": pictures(k, spec) for k, spec in LABELLED.items()}
     books |= {f"labels_{k}.ipynb": example(*parts) for k, parts in EXAMPLES.items()}
     books["label_tools.ipynb"] = tools()
+    books |= {f"results_{k}.ipynb": results(k, spec) for k, spec in RESULTS.items()}
     return books
 
 

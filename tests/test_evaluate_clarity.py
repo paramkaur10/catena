@@ -7,6 +7,8 @@ from __future__ import annotations
 import copy
 import csv
 import json
+import sys
+import types
 import warnings
 import zipfile
 from itertools import pairwise
@@ -380,7 +382,8 @@ def test_scoring_a_set(data, tmp_path):
     assert any("OmniCloudMask, NIR from blue" in line for line in lines)
     assert any("Test E: IRIDE Eaglet II" in line for line in lines)
     kept = np.load(tmp_path / "maps" / f"eaglet2__{EAGLET}.npz")
-    assert set(kept.files) == {"label", "m", "m2", "ocm4_nirblue", "ocm4_nirzeros"}
+    assert set(kept.files) == {"label", "m", "m2", "ocm4_nirblue", "ocm4_nirzeros", "rgb", "step"}
+    assert kept["rgb"].shape == (50, 60, 3) and kept["rgb"].dtype == np.uint8 and kept["step"] == 1
     rows, lines = E.score_set(sets["perusat1"], fake(30))
     pooled = next(r for r in rows if r["scene"] == "all" and r["model"] == "m")
     assert np.isnan(pooled["f1_mean"]) and 0 <= pooled["cloud_ba"] <= 1
@@ -421,3 +424,49 @@ def test_the_command(data, tmp_path, capsys):
     assert "4 cameras beyond the range" in out and "Test D: IRIDE HEO test scenes" in out
     with pytest.raises(SystemExit):
         E.parse_args([str(runs), "--a-size", "40"])
+
+
+def test_omnicloudmask_beside_on_landsat(data, monkeypatch):
+    seen = []
+
+    def ocm(red, green, nir):
+        seen.append((red, green, nir))
+        out = np.where(red > np.median(red[red > 0]), 2, 0).astype(np.uint8)  # Catena's codes
+        out[:, :3] = 255
+        return out
+
+    sets = {s.name: s for s in E.scene_sets(data, ["B", "C"], ocm)}
+    first = next(sets["landsat8"].items())
+    assert set(first.others) == {"ocm4"} and len(seen) == 1
+    red, green, nir = seen[0]
+    rho = first.to_rho(first.image[None])[0]
+    assert np.allclose(red, rho[3]) and np.allclose(green, rho[2]) and np.allclose(nir, rho[4])
+    assert (first.label[:, :8] == 255).all()  # no data there, for both
+    assert sets["landsat8"].rgb == (3, 2, 1) and sets["landsat7"].rgb == (2, 1, 0)
+    rows, lines = E.score_set(sets["landsat7"], fake(10))
+    assert {r["model"] for r in rows} == {"m", "m2", "ocm4"}
+    assert any("the labels do not come from it" in line for line in lines)
+    assert not E.scene_sets(data, ["B"])[0].note  # without OmniCloudMask, no note
+
+    calls = []
+
+    def predict_from_array(stack, **settings):
+        calls.append(settings)
+        return np.ones((1, *stack.shape[1:]), np.uint8)  # its code 1: thick cloud
+
+    module = types.ModuleType("omnicloudmask")
+    module.predict_from_array = predict_from_array
+    monkeypatch.setitem(sys.modules, "omnicloudmask", module)
+    red = np.array([[0.2, 0.0], [0.3, 0.1]], np.float32)
+    green = np.array([[0.2, 0.0], [0.0, 0.1]], np.float32)
+    out = E.omnicloudmask(red, green, red, "cpu")
+    assert out.tolist() == [[2, 255], [2, 2]]  # thick in Catena's codes; no data where both 0
+    assert calls == [
+        {"model_version": 4.0, "no_data_value": 0, "inference_device": "cpu", "batch_size": 4}
+    ]
+
+
+def test_default_out(tmp_path):
+    assert E.default_out(tmp_path, list(E.TESTS), False) == tmp_path / "clarity_tests.csv"
+    assert E.default_out(tmp_path, ["E", "D"], False).name == "clarity_tests_DE.csv"
+    assert E.default_out(tmp_path, ["B", "C", "D", "E"], True).name == "clarity_tests_BCDE_ocm.csv"

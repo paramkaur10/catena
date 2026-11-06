@@ -2,7 +2,7 @@
 sets, beside OmniCloudMask wherever its predictions exist.
 
     python -m catena.evaluate_clarity RUNS [--data /root/catena_data] [--tests A B C D E F]
-        [--device cuda:0] [--windows 800] [--out RUNS/clarity_tests.csv] [--maps DIR]
+        [--device cuda:0] [--windows 800] [--ocm] [--maps DIR] [--out CSV]
 
 RUNS holds one folder per seed (seed0, seed1, ...) with final.pt, as scripts/big.sh makes
 them. The tests, by what the networks met in training:
@@ -32,7 +32,9 @@ same pixels; for Eaglet II both drafts, near infrared filled with blue (ocm4_nir
 the labels start from) and with zeros (ocm4_nirzeros). The labels were made by correcting
 these drafts, so this comparison leans towards OmniCloudMask: wherever the review kept a draft
 as it was, OmniCloudMask scores perfectly by construction. A Clarity win is the conservative
-result.
+result. With --ocm, OmniCloudMask also runs on Landsat 8 and Landsat 7 (B, C), as it ran for
+the drafts (model 4.0 on red, green and near infrared): labels that do not come from it, on a
+satellite (Landsat 7) neither model trained on, so an even comparison.
 
 Scores pool the pixels of a set: cloud (thin or thick) against not cloud, as F1 and balanced
 accuracy, and the F1 of thin and of thick cloud, over every scene; the F1 of clear and of
@@ -47,8 +49,10 @@ scene (and per set the pooled scores, scene "all"), model and size, with the con
 (6 x 4: rows the label codes 0 clear, 1 thin, 2 thick, 3 shadow, 4 cloud, 5 not cloud; columns
 the predicted class clear, thin, thick, shadow) and the scores. Prints per set the mean and the
 standard deviation over the seeds of each version, and OmniCloudMask. A set that fails is
-reported and skipped. --maps DIR keeps every scene's predictions, label and drafts, one .npz
-per scene, for pictures.
+reported and skipped. Without --out, the CSV is clarity_tests.csv for all six tests and
+clarity_tests_<tests>[_ocm].csv otherwise, so a partial run never overwrites the full one.
+--maps DIR keeps every scene's predictions, label, OmniCloudMask's classes and true colour,
+one .npz per scene, for pictures (catena.maps, notebooks/results_<dataset>.ipynb).
 """
 
 from __future__ import annotations
@@ -84,6 +88,8 @@ EVERY = ("cloud_f1", "cloud_ba", "f1_thin", "f1_thick")  # over every scene
 SHADOWED = ("f1_clear", "f1_shadow", "f1_mean", "accuracy")  # over scenes with shadow labels
 SHOWN = ("cloud_f1", "cloud_ba", "f1_thin", "f1_thick", "f1_shadow", "f1_mean", "accuracy")
 HEADS = ("cloud F1", "cloud BA", "F1 thin", "F1 thick", "F1 shadow", "F1 mean", "accuracy")
+OCM_VERSION = 4.0  # OmniCloudMask's model, as for the drafts
+GAMMA = 0.5  # the true colour's gamma, as the review's pictures (catena.drafts)
 OCM = {
     "ocm4": "OmniCloudMask",
     "ocm4_nirblue": "OmniCloudMask, NIR from blue",
@@ -115,13 +121,20 @@ class Item:
 
 @dataclass
 class SceneSet:
-    """A set of scenes, read one at a time by items()."""
+    """A set of scenes, read one at a time by items(); rgb, where red, green and blue sit
+    among an item's bands; note, what OmniCloudMask's classes are here."""
 
     test: str  # A-F
     name: str
     title: str
     scenes: int
     items: Callable[[], Iterator[Item]]
+    rgb: tuple[int, int, int] = (0, 1, 2)
+    note: str = ""
+
+
+DRAFTED = "OmniCloudMask: its drafts, which the labels were corrected from"
+RAN = "OmniCloudMask: run here, model 4.0 on red, green and NIR; the labels do not come from it"
 
 
 # --- predicting a scene in tiles ------------------------------------------------------------
@@ -252,26 +265,58 @@ def read_rows(path: Path) -> list[dict]:
         return list(csv.DictReader(f))
 
 
-def landsat_set(test: str, module, root: Path, title: str) -> SceneSet:
+def omnicloudmask(red: np.ndarray, green: np.ndarray, nir: np.ndarray, device) -> np.ndarray:
+    """OmniCloudMask's classes (H, W) in Catena's codes, run as for the drafts
+    (scripts/ocm_prelabel.py): model 4.0 on red, green and near infrared, 0 = no data, and
+    no prediction where red and green both have none."""
+    from omnicloudmask import predict_from_array  # loads PyTorch
+
+    stack = np.stack([red, green, nir]).astype(np.float32)
+    settings = {"no_data_value": 0, "inference_device": str(device), "batch_size": 4}
+    classes = predict_from_array(stack, model_version=OCM_VERSION, **settings)[0]
+    classes = classes.astype(np.uint8)
+    classes[(red <= 0) & (green <= 0)] = NO_LABEL
+    return viz.FROM_OCM[classes]
+
+
+def some_bands(module, scene, dn: np.ndarray, bands, rows: int = 1024) -> np.ndarray:
+    """The reflectance of a few bands of a Landsat scene (len(bands), H, W), a strip of rows
+    at a time, so the whole scene is never in float32 at once."""
+    out = np.zeros((len(bands), *dn.shape[1:]), np.float32)
+    for r0 in range(0, dn.shape[1], rows):
+        out[:, r0 : r0 + rows] = module.reflectance(scene, dn[:, r0 : r0 + rows])[list(bands)]
+    return out
+
+
+def landsat_set(test: str, module, root: Path, title: str, ocm=None) -> SceneSet:
+    """A Landsat test set; with ocm(red, green, nir) -> classes, OmniCloudMask beside."""
     chosen = module.scenes(root, "pilot")
+    landsat8 = module is biome
+    rgb, rgn = ((3, 2, 1), (3, 2, 4)) if landsat8 else ((2, 1, 0), (2, 1, 3))
 
     def items() -> Iterator[Item]:
         for scene in chosen:
             dn, label = module.read(scene)
             label = np.where(dn.all(axis=0), label, NO_LABEL).astype(np.uint8)
+            others = {}
+            if ocm is not None:
+                others["ocm4"] = ocm(*some_bands(module, scene, dn, rgn))
+                label = with_drafts(label, others)
             yield Item(
                 scene.name,
                 dn,
                 desc.card(module.descriptors(scene)),
                 label,
                 lambda x, scene=scene: module.reflectance(scene, x),
+                others,
                 shadow_ok=scene.has_shadow,
                 tile=LANDSAT_TILE,
                 margin=LANDSAT_MARGIN,
             )
 
-    name = "landsat8" if module is biome else "landsat7"
-    return SceneSet(test, name, f"{title}, {len(chosen)} scenes", len(chosen), items)
+    name = "landsat8" if landsat8 else "landsat7"
+    title = f"{title}, {len(chosen)} scenes"
+    return SceneSet(test, name, title, len(chosen), items, rgb, RAN if ocm else "")
 
 
 def heo_set(data: Path, role: str, title: str) -> SceneSet:
@@ -285,7 +330,8 @@ def heo_set(data: Path, role: str, title: str) -> SceneSet:
             label = with_drafts(np.where(dn.all(axis=0), label, NO_LABEL), drafts)
             yield Item(scene.name, dn, card, label, heo.reflectance, drafts, shadow_labelled(label))
 
-    return SceneSet("D", f"heo_{role}", f"{title}, {len(chosen)} scenes", len(chosen), items)
+    title = f"{title}, {len(chosen)} scenes"
+    return SceneSet("D", f"heo_{role}", title, len(chosen), items, (3, 2, 1), DRAFTED)
 
 
 def eaglet2_set(data: Path) -> SceneSet:
@@ -300,7 +346,7 @@ def eaglet2_set(data: Path) -> SceneSet:
             yield Item(scene.name, rho, card, label, same, drafts, shadow_labelled(label))
 
     title = f"IRIDE Eaglet II, never seen, {len(chosen)} scenes"
-    return SceneSet("E", "eaglet2", title, len(chosen), items)
+    return SceneSet("E", "eaglet2", title, len(chosen), items, (0, 1, 2), DRAFTED)
 
 
 def phisat2_descriptors(info: dict) -> np.ndarray:
@@ -337,7 +383,7 @@ def phisat2_set(data: Path) -> SceneSet:
             yield Item(r["scene"], rho, card, label, same, drafts, shadow_labelled(label))
 
     title = f"Phi-sat-2, never seen, {len(chosen)} scenes"
-    return SceneSet("E", "phisat2", title, len(chosen), items)
+    return SceneSet("E", "phisat2", title, len(chosen), items, (3, 2, 1), DRAFTED)
 
 
 def perusat_set(root: Path) -> SceneSet:
@@ -350,14 +396,16 @@ def perusat_set(root: Path) -> SceneSet:
             yield Item(f"patch {n}", dn, card, label, perusat.reflectance, shadow_ok=False)
 
     title = f"PeruSat-1, CloudPeru2 validation split, {len(names)} patches (cloud or not)"
-    return SceneSet("F", "perusat1", title, len(names), items)
+    return SceneSet("F", "perusat1", title, len(names), items, (2, 1, 0))
 
 
-def scene_sets(data: Path, tests) -> list[SceneSet]:
-    """The scene sets of tests B-F that have their data; a note for each one that does not."""
+def scene_sets(data: Path, tests, ocm=None) -> list[SceneSet]:
+    """The scene sets of tests B-F that have their data; a note for each one that does not.
+    ocm(red, green, nir) -> classes runs OmniCloudMask on the Landsat sets."""
+    l8, l7 = data / "chips/l8_biome", data / "chips/l7_irish"
     makers = {
-        "B": [lambda: landsat_set("B", biome, data / "chips/l8_biome", "Landsat 8 (L8 Biome)")],
-        "C": [lambda: landsat_set("C", irish, data / "chips/l7_irish", "Landsat 7 (L7 Irish)")],
+        "B": [lambda: landsat_set("B", biome, l8, "Landsat 8 (L8 Biome)", ocm)],
+        "C": [lambda: landsat_set("C", irish, l7, "Landsat 7 (L7 Irish)", ocm)],
         "D": [
             lambda: heo_set(data, "test", "IRIDE HEO test scenes"),
             lambda: heo_set(data, "stress", "IRIDE HEO stress scenes (version A02)"),
@@ -551,7 +599,9 @@ def score_set(ts: SceneSet, classify, maps: Path | None = None) -> tuple[list[di
         if maps is not None:
             maps.mkdir(parents=True, exist_ok=True)
             arrays = {m.replace("/", "_"): p for m, p in preds.items()}
-            np.savez_compressed(maps / f"{ts.name}__{item.name}.npz", label=item.label, **arrays)
+            picture, k = true_colour(item, ts.rgb)
+            path = maps / f"{ts.name}__{item.name}.npz"
+            np.savez_compressed(path, label=item.label, rgb=picture, step=k, **arrays)
         pixels = int((item.label != NO_LABEL).sum())
         print(
             f"  {ts.test} {ts.name} {item.name}: {pixels:,} pixels "
@@ -570,9 +620,18 @@ def score_set(ts: SceneSet, classify, maps: Path | None = None) -> tuple[list[di
     ]
     if per_model:
         lines += table(per_model)
-    if any(m in OCM for m in per_model):
-        lines.append("  (OmniCloudMask: its drafts, which the labels were corrected from)")
+    if any(m in OCM for m in per_model) and ts.note:
+        lines.append(f"  ({ts.note})")
     return rows, lines
+
+
+def true_colour(item: Item, rgb, longest: int = 1000) -> tuple[np.ndarray, int]:
+    """The scene's true colour, every k-th pixel (k the smallest that keeps it within
+    `longest` across), as (h, w, 3) uint8: the review's 2-98% stretch and gamma; and k."""
+    k = viz.step(item.image.shape[1:], longest)
+    rho = item.to_rho(np.ascontiguousarray(item.image[None, :, ::k, ::k]))[0]
+    picture = viz.stretch(rho[list(rgb)], gamma=GAMMA)
+    return np.round(picture * 255).astype(np.uint8), k
 
 
 def camera_lines(found: dict, size: int = TILE) -> tuple[list[dict], list[str]]:
@@ -616,12 +675,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--batch", type=int, default=16, help="Test A: windows per batch")
     p.add_argument("--workers", type=int, default=6, help="Test A: data-loading processes")
     p.add_argument("--device", help="default cuda:0 if there is a GPU, else cpu")
-    p.add_argument("--out", type=Path, help="the CSV (default RUNS/clarity_tests.csv)")
+    p.add_argument("--ocm", action="store_true", help="OmniCloudMask on Landsat 8 and 7 too")
+    p.add_argument("--out", type=Path, help="the CSV (default: see above)")
     p.add_argument("--maps", type=Path, help="keep every scene's predictions here (.npz)")
     args = p.parse_args(argv)
     if args.a_size <= 0 or args.a_size % 24:
         p.error("--a-size must be a multiple of 24: of 8 at 10 m and at 30 m")
     return args
+
+
+def default_out(runs: Path, tests, ocm: bool) -> Path:
+    """clarity_tests.csv for the six tests, clarity_tests_<tests>[_ocm].csv otherwise."""
+    if set(tests) == set(TESTS) and not ocm:
+        return Path(runs) / "clarity_tests.csv"
+    return Path(runs) / f"clarity_tests_{''.join(sorted(tests))}{'_ocm' if ocm else ''}.csv"
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -633,7 +700,7 @@ def main(argv: list[str] | None = None) -> None:
     torch.backends.cudnn.benchmark = True
     nets = load_runs(args.runs, device)
     tests = [t for t in TESTS if t in args.tests]
-    out = args.out or args.runs / "clarity_tests.csv"
+    out = args.out or default_out(args.runs, tests, args.ocm)
     print(f"{len(nets)} networks ({', '.join(nets)}) on {device}; tests {' '.join(tests)}")
     started, rows, report = time.perf_counter(), [], []
 
@@ -654,7 +721,8 @@ def main(argv: list[str] | None = None) -> None:
         else:
             print(f"test A left out: no {chips / 'index.csv'}", flush=True)
     classify = classifier(nets, device, amp)
-    for ts in scene_sets(args.data, [t for t in tests if t != "A"]):
+    ocm = (lambda r, g, n: omnicloudmask(r, g, n, device)) if args.ocm else None
+    for ts in scene_sets(args.data, [t for t in tests if t != "A"], ocm):
         try:
             keep(*score_set(ts, classify, args.maps))
         except Exception:  # one broken set must not cost the others

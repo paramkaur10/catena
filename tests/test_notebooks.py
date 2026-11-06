@@ -25,6 +25,11 @@ NAMES = {
     "labels_l7_irish.ipynb",
     "labels_cloudperu2.ipynb",
     "label_tools.ipynb",
+    "results_iride_heo.ipynb",
+    "results_iride_eaglet2.ipynb",
+    "results_phisat2.ipynb",
+    "results_l7_irish.ipynb",
+    "results_l8_biome.ipynb",
 }
 WRITES = ("fix", "save_label", "decide", "keep_labels", "export_for_editing")
 
@@ -74,6 +79,11 @@ def test_notebooks(tmp_path, capsys):
     for switch in ('NAME = ""', "PAGES = False", "WRITE = False", "KEEP = False"):
         assert switch in tools
     assert "d.compare(s, OTHER)" in tools and '"iride_eaglet2": "ocm4_nirzeros"' in tools
+    heo_results = text(tmp_path / "results_iride_heo.ipynb")
+    assert "('heo_test', 'heo_stress')" in heo_results and "corrected from" in heo_results
+    l7_results = text(tmp_path / "results_l7_irish.ipynb")
+    assert "('landsat7',)" in l7_results and "the comparison is even" in l7_results
+    assert 'MAPS = Path("/root/catena_data/runs/big/maps")' in l7_results
     pictures = text(tmp_path / "labels_phisat2.ipynb")
     assert '"phisat2", draft="ocm4"' in pictures and "viz.sheet(items" in pictures
     assert "labelling_phisat2.ipynb" in pictures and "d.fix" not in pictures
