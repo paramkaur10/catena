@@ -3,7 +3,7 @@
     python -m catena.train_clarity OUT [--data /root/catena_data] [--seed 0] [--steps 60000]
         [--arms real sim] [--shares 0.4 0.2 0.2 0.2] [--devices cuda:0 cuda:1]
         [--q-weights 1 1 1] [--faults 0] [--fault-gain 0.3] [--fault-nir 0.4]
-        [--chain-jitter 1]
+        [--chain-jitter 1] [--trunk CODE [CODE]]
 
 Clarity reads, for each band, only what every product states (catena.descriptor.card): its
 wavelengths, surface or top-of-atmosphere reflectance, the band's pixel size against the
@@ -31,6 +31,9 @@ read:
           infrared in that order, as a network made for one band set; the same windows,
           pixel sizes and made-up cameras or not as sim, but always these four bands, with
           gains and a camera of their own.
+  nas     a trunk the architecture search found (catena.nas): the band encoder in front of
+  nas2    PyNAS's U-Net for an architecture code (--trunk, one code per nas arm, in --arms
+          order), trained end to end like the others; it reads the card.
 With the same seed every arm sees what the first big run's sim version saw: what an arm adds
 (its four bands, dropout and errors) is drawn from random streams of its own.
 
@@ -87,7 +90,7 @@ from catena import descriptor as desc
 from catena import sim
 from catena import train as T
 from catena.data import biome, heo, loader, perusat
-from catena.model import Clarity, FixedBands, count_parameters
+from catena.model import BandEncoder, Clarity, FixedBands, count_parameters
 
 VERSIONS = ("real", "sim")  # the first big run's arms, the default
 SOURCES = ("sentinel2", "landsat8", "heo", "perusat1")
@@ -112,9 +115,9 @@ RGBN = {  # where blue, green, red and near infrared sit among each satellite's 
 # write counts as its default (OLDER)
 SAME_ARGS = ("seed", "steps", "batch", "size", "landsat_size", "heo_size", "perusat_size")
 SAME_ARGS += ("shares", "p_s2", "widths", "stem", "lr", "weight_decay", "warmup", "hold_out")
-SAME_ARGS += ("q_weights", "faults", "fault_gain", "fault_nir", "arms", "chain_jitter")
+SAME_ARGS += ("q_weights", "faults", "fault_gain", "fault_nir", "arms", "chain_jitter", "trunk")
 OLDER = {"q_weights": [1.0, 1.0, 1.0], "faults": 0.0, "fault_gain": 0.3, "fault_nir": 0.4}
-OLDER |= {"arms": list(VERSIONS), "chain_jitter": 1.0}
+OLDER |= {"arms": list(VERSIONS), "chain_jitter": 1.0, "trunk": None}
 
 
 @dataclass(frozen=True)
@@ -135,14 +138,30 @@ ARMS = {
     "chain": Arm("sim", desc.N_CHAIN_CARD),
     "blind": Arm("sim", desc.N_CARD, blind=True),
     "fixed": Arm("sim", 0),
+    "nas": Arm("sim", desc.N_CARD),
+    "nas2": Arm("sim", desc.N_CARD),
 }
+NAS = ("nas", "nas2")  # the arms whose trunk is an architecture code
 
 
-def build(name: str, widths, stem: int) -> torch.nn.Module:
-    """An arm's network, its weights drawn from torch's generator as it stands."""
+def build(name: str, widths, stem: int, code: str | None = None) -> torch.nn.Module:
+    """An arm's network, its weights drawn from torch's generator as it stands; a nas arm's
+    trunk is PyNAS's U-Net for the architecture code."""
+    if name in NAS:
+        from catena import nas  # PyNAS is needed only here
+
+        if not code:
+            raise ValueError(f"the {name} arm needs an architecture code")
+        return nas.Candidate(BandEncoder(stem, ARMS[name].fields), nas.build_trunk(code, 2 * stem))
     if ARMS[name].fields == 0:
         return FixedBands(widths=tuple(widths), stem=stem)
     return Clarity(widths=tuple(widths), stem=stem, fields=ARMS[name].fields)
+
+
+def codes_of(arms, trunk) -> dict[str, str]:
+    """{nas arm: its architecture code}, in --arms order."""
+    found = [a for a in arms if a in NAS]
+    return dict(zip(found, trunk or [], strict=True))
 
 
 def rgbn_slots(names) -> list[int]:
@@ -417,6 +436,12 @@ def validate(models: dict, devices: dict, data: DataLoader, amp: dict) -> dict:
     return {a: m.cpu().numpy() for a, m in conf.items()}
 
 
+def designs(arms, config: dict) -> dict:
+    """Each arm's design, with its architecture code for a nas arm."""
+    trunks = config.get("trunks", {})
+    return {a: asdict(ARMS[a]) | ({"code": trunks[a]} if a in trunks else {}) for a in arms}
+
+
 def save(path: Path, step: int, models: dict, config: dict, opts=None, scheds=None) -> None:
     """Both arms (with their optimisers and schedules, to go on from) and their designs,
     written atomically."""
@@ -425,7 +450,7 @@ def save(path: Path, step: int, models: dict, config: dict, opts=None, scheds=No
         "config": config,
         "card": [desc.FIELDS[k] for k in desc.CARD],
         "chain_card": [desc.FIELDS[k] for k in desc.CHAIN_CARD],
-        "arms": {a: asdict(ARMS[a]) for a in models},
+        "arms": designs(models, config),
         "models": {a: net.state_dict() for a, net in models.items()},
     }
     if opts is not None:
@@ -434,6 +459,28 @@ def save(path: Path, step: int, models: dict, config: dict, opts=None, scheds=No
     tmp = path.with_suffix(".tmp")
     torch.save(state, tmp)
     tmp.replace(path)
+
+
+def training_data(args) -> tuple[loader.TrainingWindows, dict]:
+    """The Sentinel-2 training windows (steps x batch of them) and the windows of every other
+    satellite with a share of the batches (None for the others), as args says."""
+    s2 = args.s2 or args.data / "chips" / "cloudsen12plus"
+    shares = dict(zip(SOURCES, args.shares, strict=True))
+    data = {"landsat8": None, "heo": None, "perusat1": None}
+    if shares["landsat8"] > 0:
+        l8 = args.biome or args.data / "chips" / "l8_biome"
+        held = {s.name for s in biome.scenes(l8, args.hold_out)}
+        chosen = [s for s in biome.scenes(l8, "index") if s.name not in held]
+        data["landsat8"] = biome.Windows(chosen, size=args.landsat_size)
+    if shares["heo"] > 0:
+        data["heo"] = heo.Windows(heo.scenes(args.data, ("train",)), size=args.heo_size)
+    if shares["perusat1"] > 0:
+        root = args.perusat or args.data / "chips" / "cloudperu2"
+        data["perusat1"] = perusat.Windows(root, "train", size=args.perusat_size)
+    windows = loader.TrainingWindows(
+        s2, "train", size=args.size, length=args.steps * args.batch, seed=args.seed
+    )
+    return windows, data
 
 
 def breakdown(args, windows, data: dict) -> list[dict]:
@@ -536,6 +583,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--chain-jitter", type=float, default=1.0, help="chain: errors of the MTF and SNR, 0-1"
     )
+    p.add_argument("--trunk", nargs="+", help="nas, nas2: their architecture codes (catena.nas)")
     p.add_argument("--widths", type=int, nargs=4, default=[32, 64, 128, 256])
     p.add_argument("--stem", type=int, default=16)
     p.add_argument("--log-every", type=int, default=100)
@@ -562,6 +610,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p.error("--faults: the fixed arm takes none")
     if args.chain_jitter < 0:
         p.error("--chain-jitter: 0 or more")
+    if len(args.trunk or []) != sum(a in NAS for a in args.arms):
+        p.error("--trunk: one architecture code for each nas arm, none without")
     return args
 
 
@@ -580,10 +630,11 @@ def main(argv: list[str] | None = None) -> None:
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
 
+    trunks = codes_of(arms, args.trunk)
     models = {}
     for a in arms:
         torch.manual_seed(args.seed)  # arms of one design start from the same weights
-        models[a] = build(a, args.widths, args.stem).to(devices[a]).train()
+        models[a] = build(a, args.widths, args.stem, trunks.get(a)).to(devices[a]).train()
     opts = {
         v: torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         for v, net in models.items()
@@ -593,22 +644,7 @@ def main(argv: list[str] | None = None) -> None:
         for v, opt in opts.items()
     }
     weights = {a: T.CODE_WEIGHTS.to(dev) for a, dev in devices.items()}
-
-    shares = dict(zip(SOURCES, args.shares, strict=True))
-    data = {"landsat8": None, "heo": None, "perusat1": None}
-    if shares["landsat8"] > 0:
-        l8 = args.biome or args.data / "chips" / "l8_biome"
-        held = {s.name for s in biome.scenes(l8, args.hold_out)}
-        chosen = [s for s in biome.scenes(l8, "index") if s.name not in held]
-        data["landsat8"] = biome.Windows(chosen, size=args.landsat_size)
-    if shares["heo"] > 0:
-        data["heo"] = heo.Windows(heo.scenes(args.data, ("train",)), size=args.heo_size)
-    if shares["perusat1"] > 0:
-        root = args.perusat or args.data / "chips" / "cloudperu2"
-        data["perusat1"] = perusat.Windows(root, "train", size=args.perusat_size)
-    windows = loader.TrainingWindows(
-        s2, "train", size=args.size, length=args.steps * args.batch, seed=args.seed
-    )
+    windows, data = training_data(args)
     rows = breakdown(args, windows, data)
 
     arguments = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
@@ -644,7 +680,8 @@ def main(argv: list[str] | None = None) -> None:
             },
             "bf16": amp,
             "parameters": {a: count_parameters(net) for a, net in models.items()},
-            "arms": {a: asdict(ARMS[a]) for a in arms},
+            "trunks": trunks,
+            "arms": designs(arms, {"trunks": trunks}),
             "card": [desc.FIELDS[k] for k in desc.CARD],
             "chain_card": [desc.FIELDS[k] for k in desc.CHAIN_CARD],
             "sources": rows,
@@ -711,6 +748,7 @@ def main(argv: list[str] | None = None) -> None:
     for a in arms:
         n = config["parameters"][a]
         net = "FixedBands" if ARMS[a].fields == 0 else f"Clarity reading {ARMS[a].fields} numbers"
+        net = f"band encoder and PyNAS trunk {trunks[a]}" if a in trunks else net
         net += ", told nothing" if ARMS[a].blind else ""
         print(
             f"  {a:<7}{net}; {ARMS[a].data}'s samples; {n:,} parameters, "

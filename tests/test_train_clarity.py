@@ -288,7 +288,8 @@ def test_what_the_arms_add_is_drawn_apart(data):
 
 
 def test_the_arms():
-    assert set(C.ARMS) == {"real", "sim", "sensei", "chain", "blind", "fixed"}
+    assert set(C.ARMS) == {"real", "sim", "sensei", "chain", "blind", "fixed", "nas", "nas2"}
+    assert C.NAS == ("nas", "nas2") and C.codes_of(["nas", "sim"], ["L"]) == {"nas": "L"}
     assert C.ARMS["sensei"].fields == 4 and C.ARMS["chain"].fields == 11  # their first numbers
     assert C.ARMS["fixed"].fields == 0 and C.ARMS["blind"].blind
     assert all(a.data == "sim" for k, a in C.ARMS.items() if k != "real")

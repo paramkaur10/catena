@@ -6,9 +6,9 @@ test the method) on six test sets, beside OmniCloudMask wherever its predictions
 
 Each RUNS folder holds finished runs (final.pt) at any depth, one folder per seed, as
 scripts/big.sh makes them (runs/big/seed0, or runs/arms/chain/seed0 for OUT=runs/arms/chain);
-each run brings its two arms (catena.train_clarity), named <seed folder>/<arm>. Two runs that
-bring the same name stop the command: evaluate them apart. The tests, by what the networks
-met in training:
+each run brings its two arms (catena.train_clarity), named <seed folder>/<arm>; a nas arm's
+trunk is rebuilt from its architecture code (catena.nas, PyNAS). Two runs that bring the same
+name stop the command: evaluate them apart. The tests, by what the networks met in training:
   A  Sentinel-2, seen: the CloudSEN12+ test split through the 23 cameras of catena.evaluate
      (Sentinel-2 as delivered, 18 four-band cameras at 10 and 30 m, 4 beyond the training
      range), --windows windows of --a-size (240) 10 m pixels per camera
@@ -85,7 +85,7 @@ from catena.data import biome, eaglet2, heo, irish, perusat, phisat2
 from catena.sensors import spec
 
 VERSIONS = ("real", "sim")  # the first big run's arms
-ARMS = ("real", "sim", "sensei", "chain", "blind", "fixed")  # in the order the tables show
+ARMS = ("real", "sim", "sensei", "chain", "blind", "fixed", "nas", "nas2")  # the tables' order
 ARM_TITLES = {
     "real": "Clarity real",
     "sim": "Clarity sim",
@@ -93,6 +93,8 @@ ARM_TITLES = {
     "chain": "Clarity + MTF, SNR",
     "blind": "Clarity told nothing",
     "fixed": "U-Net fixed bands",
+    "nas": "PyNAS trunk 1",
+    "nas2": "PyNAS trunk 2",
 }
 TESTS = ("A", "B", "C", "D", "E", "F")
 NO_LABEL = 255
@@ -474,7 +476,7 @@ def load_runs(runs, device) -> dict[str, Net]:
     A run without a list of its arms is the first big run's: real and sim, on the card."""
     import torch
 
-    from catena.model import Clarity, FixedBands
+    from catena.model import BandEncoder, Clarity, FixedBands
 
     roots = [Path(r) for r in ([runs] if isinstance(runs, str | Path) else runs)]
     nets: dict[str, Net] = {}
@@ -495,7 +497,12 @@ def load_runs(runs, device) -> dict[str, Net]:
                 if name in nets:
                     raise SystemExit(f"{name} in {where[name]} and {folder}: evaluate them apart")
                 fields, widths = int(design["fields"]), tuple(args["widths"])
-                if fields == 0:
+                if design.get("code"):  # a trunk the architecture search found
+                    from catena import nas
+
+                    trunk = nas.build_trunk(design["code"], 2 * args["stem"])
+                    net = nas.Candidate(BandEncoder(args["stem"], fields), trunk)
+                elif fields == 0:
                     net = FixedBands(widths=widths, stem=args["stem"])
                 else:
                     net = Clarity(widths=widths, stem=args["stem"], fields=fields)
