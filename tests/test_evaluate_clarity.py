@@ -331,6 +331,36 @@ def test_scores():
     assert both["cloud_f1"] == pytest.approx(1.0) and np.isnan(both["f1_mean"])
 
 
+def test_card_checks():
+    told = np.arange(3 * desc.N_CHAIN_CARD, dtype=np.float32).reshape(3, desc.N_CHAIN_CARD)
+    told[:, 9:] = [[1, 1], [0, 0], [1, 0]]  # blur and noise known, neither, the blur only
+    x = np.ones((2, 3, 4, 4), np.float32)
+    rgbn = (2, 1, 0, 2)  # as Eaglet II: blue stands in for the near infrared
+    assert E.vary("honest", x, told, rgbn)[1] is told
+    shuffled = E.vary("shuffled", x, told, rgbn)[1]
+    assert (shuffled[1] == told[0]).all() and (shuffled[0] == told[2]).all()
+    for check, step in (("pixel x3", np.log2(3)), ("pixel /3", -np.log2(3))):
+        moved = E.vary(check, x, told, rgbn)[1]
+        assert moved[:, 5] == pytest.approx(told[:, 5] + step)
+        assert (np.delete(moved, 5, axis=1) == np.delete(told, 5, axis=1)).all()
+    only = E.vary("wavelengths only", x, told, rgbn)[1]
+    assert (only[:, :3] == told[:, :3]).all() and (only[:, 3:] == 0).all()
+    noisy = E.vary("noise x3", x, told, rgbn)[1]
+    assert noisy[0, 7:9] == pytest.approx(told[0, 7:9] + np.log10(3))
+    assert (noisy[1:, 7:9] == told[1:, 7:9]).all()  # unknown noise stays as it was
+    assert (E.vary("blur x2", x, told, rgbn)[1][:, 6] == 2 * told[:, 6]).all()
+    assert (told[:, 9:] == [[1, 1], [0, 0], [1, 0]]).all()  # the checks work on copies
+    vx, vtold, four = E.vary("rgbn only", x, told, rgbn)
+    assert vx.shape == (2, 3, 4, 4) and four == (0, 1, 2, 0) and (vtold == told[[2, 1, 0]]).all()
+    vx, vtold, four = E.vary("rgb only", np.ones((2, 5, 4, 4)), np.ones((5, 11)), (1, 2, 3, 4))
+    assert vx.shape == (2, 3, 4, 4) and vtold.shape == (3, 11) and four is None
+    assert E.vary("rgb only", x, told, None) is None  # where the bands are not known
+    assert E.named("seed0/sim", "honest") == "seed0/sim"
+    assert E.group_of(E.named("seed0/sim", "pixel x3")) == "Clarity sim [pixel x3]"
+    with pytest.raises(ValueError):
+        E.vary("lies", x, told, rgbn)
+
+
 # --- the sets -------------------------------------------------------------------------------
 
 
@@ -400,6 +430,13 @@ def test_scoring_a_set(data, tmp_path):
     pooled = next(r for r in rows if r["scene"] == "all" and r["model"] == "m")
     assert np.isnan(pooled["f1_mean"]) and 0 <= pooled["cloud_ba"] <= 1
     assert any("cloud or not" in line for line in lines)
+    checks = ["honest", "shuffled", "rgb only"]
+    rows, lines = E.score_set(sets["eaglet2"], fake(30), tmp_path / "checked", checks)
+    models = {r["model"] for r in rows}
+    assert {"m", "m@shuffled", "m@rgb only", "m2@rgb only", "ocm4_nirblue"} <= models
+    assert any("[shuffled]" in line for line in lines)
+    kept = np.load(tmp_path / "checked" / f"eaglet2__{EAGLET}.npz")
+    assert not any("@" in k for k in kept.files)  # the maps: honest only
 
 
 # --- the command (torch) ----------------------------------------------------------------
@@ -451,6 +488,28 @@ def test_the_command(data, tmp_path, capsys):
         E.parse_args([str(runs), "--a-size", "40"])
 
 
+def test_card_checks_on_the_command(data, tmp_path):
+    torch = pytest.importorskip("torch")
+    from catena import train_clarity as C
+
+    runs = tmp_path / "arms"
+    (runs / "seed0").mkdir(parents=True)
+    torch.manual_seed(0)
+    models = {a: C.build(a, (8, 8, 8, 8), 8) for a in ("sim", "fixed")}
+    C.save(runs / "seed0/final.pt", 1, models, {"args": {"widths": [8, 8, 8, 8], "stem": 8}})
+    args = [str(runs), "--data", str(data), "--device", "cpu", "--workers", "0", "--tests", "A"]
+    args += ["F", "--windows", "2", "--a-size", "48", "--batch", "4"]
+    E.main([*args, "--cards", "honest", "shuffled", "rgb only", "rgbn only"])
+    with open(runs / "clarity_tests_AF_cards.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
+    for test in ("A", "F"):
+        models = {r["model"] for r in rows if r["test"] == test}
+        assert {"seed0/sim", "seed0/sim@shuffled", "seed0/sim@rgb only"} <= models
+        assert "seed0/fixed@rgbn only" in models and "seed0/fixed@rgb only" not in models
+    a = {r["scene"] for r in rows if r["model"] == "seed0/sim@rgb only"}
+    assert len(a & {"sentinel2", "rgbn_10m_mtf0.3_snr150"}) == 2  # every camera, too
+
+
 def test_omnicloudmask_beside_on_landsat(data, monkeypatch):
     seen = []
 
@@ -493,6 +552,8 @@ def test_omnicloudmask_beside_on_landsat(data, monkeypatch):
 
 def test_default_out(tmp_path):
     assert E.default_out(tmp_path, list(E.TESTS), False) == tmp_path / "clarity_tests.csv"
+    checks = ["honest", "shuffled"]
+    assert E.default_out(tmp_path, ["A", "C"], False, checks).name == "clarity_tests_AC_cards.csv"
     two = [tmp_path / "big", tmp_path / "arms"]
     assert E.default_out(two, list(E.TESTS), False) == tmp_path / "arms" / "clarity_tests.csv"
     assert E.default_out(tmp_path, ["E", "D"], False).name == "clarity_tests_DE.csv"

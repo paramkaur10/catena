@@ -3,6 +3,7 @@ test the method) on six test sets, beside OmniCloudMask wherever its predictions
 
     python -m catena.evaluate_clarity RUNS [RUNS ...] [--data /root/catena_data]
         [--tests A B C D E F] [--device cuda:0] [--windows 800] [--ocm] [--maps DIR] [--out CSV]
+        [--cards honest shuffled "pixel x3" ...]
 
 Each RUNS folder holds finished runs (final.pt) at any depth, one folder per seed, as
 scripts/big.sh makes them (runs/big/seed0, or runs/arms/chain/seed0 for OUT=runs/arms/chain);
@@ -62,6 +63,21 @@ for all six tests and clarity_tests_<tests>[_ocm].csv otherwise, so a partial ru
 overwrites the full one.
 --maps DIR keeps every scene's predictions, label, OmniCloudMask's classes and true colour,
 one .npz per scene, for pictures (catena.maps, notebooks/results_<dataset>.ipynb).
+
+Card checks (--cards): every network also sees each scene (and each Test A window) as told
+otherwise, no training needed; a network that reads its card must do worse when the card is
+wrong, and should hold up when bands go missing. Its rows are named <model>@<check>:
+  honest            every card as the product states it (the plain test)
+  shuffled          each band given the next band's card: the wavelengths all wrong
+  pixel x3          the pixels told 3 times larger than they are (the grid's pixel size)
+  pixel /3          the pixels told 3 times smaller than they are
+  wavelengths only  the card's other numbers 0: top of atmosphere, a 10 m grid, no chain
+  rgbn only         only blue, green, red and near infrared kept (the bands themselves)
+  rgb only          only blue, green and red kept; the fixed arm has nothing to read
+  noise x3          the noise told 3 times larger where it is known (the chain arm reads it)
+  blur x2           the blur told twice as wide where it is known
+Without --out, a run with checks other than honest writes clarity_tests_<tests>[_ocm]_cards.csv;
+the maps (--maps) keep the honest predictions only.
 """
 
 from __future__ import annotations
@@ -206,6 +222,72 @@ def predict(classify, item: Item) -> dict[str, np.ndarray]:
             for (r, c, (r0, r1), (c0, c1)), p in zip(part, classes, strict=True):
                 pred[r0:r1, c0:c1] = p[r0 - r : r1 - r, c0 - c : c1 - c]
     return {model: pred[:h, :w] for model, pred in out.items()}
+
+
+# --- card checks ----------------------------------------------------------------------------
+
+CARDS = (
+    "honest",
+    "shuffled",
+    "pixel x3",
+    "pixel /3",
+    "wavelengths only",
+    "rgbn only",
+    "rgb only",
+    "noise x3",
+    "blur x2",
+)
+GSD_AT, PSF_AT, NOISE_AT, KNOWN_PSF_AT, KNOWN_NOISE_AT = 5, 6, (7, 8), 9, 10  # in a chain card
+
+
+def _copied(a):
+    return a.copy() if isinstance(a, np.ndarray) else a.clone()
+
+
+def vary(check: str, x, told, rgbn):
+    """A batch as a card check tells it (CARDS): x (n, bands, h, w), told (..., bands, 11),
+    rgbn where blue, green, red and near infrared sit among the bands (or None). Numpy arrays
+    or torch tensors; the result (x, told, rgbn), or None where the check cannot apply (a
+    band check without rgbn)."""
+    if check not in CARDS:
+        raise ValueError(f"unknown card check: {check}")
+    if check == "honest":
+        return x, told, rgbn
+    if check in ("rgbn only", "rgb only"):
+        if rgbn is None:
+            return None
+        keep = list(dict.fromkeys(rgbn if check == "rgbn only" else rgbn[:3]))
+        four = tuple(keep.index(b) for b in rgbn) if check == "rgbn only" else None
+        return x[:, keep], told[..., keep, :], four
+    told = _copied(told)
+    if check == "shuffled":
+        told = np.roll(told, 1, axis=-2) if isinstance(told, np.ndarray) else told.roll(1, -2)
+    elif check in ("pixel x3", "pixel /3"):
+        told[..., GSD_AT] += math.log2(3) if check == "pixel x3" else -math.log2(3)
+    elif check == "wavelengths only":
+        told[..., 3:] = 0
+    elif check == "noise x3":
+        told[..., NOISE_AT[0] : NOISE_AT[1] + 1] += (
+            math.log10(3) * told[..., KNOWN_NOISE_AT : KNOWN_NOISE_AT + 1]
+        )
+    else:  # blur x2: an unknown blur (0) stays 0
+        told[..., PSF_AT] *= 2
+    return x, told, rgbn
+
+
+def checked(classify, check: str):
+    """classify(x, told, rgbn) as a card check tells it; nothing where it cannot apply."""
+
+    def run(x, told, rgbn=None):
+        varied = vary(check, x, told, rgbn)
+        return {} if varied is None else classify(*varied)
+
+    return run
+
+
+def named(model: str, check: str) -> str:
+    """seed0/sim under a check: seed0/sim@shuffled; honest keeps the plain name."""
+    return model if check == "honest" else f"{model}@{check}"
 
 
 # --- scores ---------------------------------------------------------------------------------
@@ -551,9 +633,18 @@ def classifier(nets: dict[str, Net], device, amp: bool):
 
 
 def cameras(
-    nets: dict, chips: Path, n: int, size: int, device, amp: bool, workers: int, batch: int
+    nets: dict,
+    chips: Path,
+    n: int,
+    size: int,
+    device,
+    amp: bool,
+    workers: int,
+    batch: int,
+    cards=("honest",),
 ):
-    """Test A: {camera name: {model: 6 x 4 confusion matrix}}, one camera at a time."""
+    """Test A: {camera name: {model: 6 x 4 confusion matrix}}, one camera at a time, each
+    model under every card check (named <model>@<check>)."""
     import torch
     from torch.utils.data import DataLoader
 
@@ -574,18 +665,27 @@ def cameras(
             pin_memory=device.type == "cuda",
             worker_init_fn=T.quiet,
         )
-        conf = {model: torch.zeros(4, 4, dtype=torch.long, device=device) for model in nets}
+        conf: dict = {}
         four = rgbn_slots(camera[2])
+        bands = len(camera[2])  # the camera's bands fill the first slots of every window
         with torch.no_grad():
             for b in batches:
-                x = b["image"].to(device, non_blocking=True)
-                real = b["real"].to(device, non_blocking=True)
-                told = desc.chain_card(b["d_told"]).to(device, non_blocking=True)
+                x = b["image"][:, :bands].to(device, non_blocking=True)
+                told = desc.chain_card(b["d_told"][:, :bands]).to(device, non_blocking=True)
                 y = b["label"].to(device, non_blocking=True)
                 ok = y < 4
-                for model, logits in run_nets(nets, x, told, real, four, amp).items():
-                    pairs = y[ok] * 4 + logits.argmax(dim=1)[ok]
-                    conf[model] += torch.bincount(pairs, minlength=16).view(4, 4)
+                for check in cards:
+                    varied = vary(check, x, told, four)
+                    if varied is None:
+                        continue
+                    vx, vtold, vfour = varied
+                    real = torch.ones(vx.shape[:2], dtype=torch.bool, device=device)
+                    for model, logits in run_nets(nets, vx, vtold, real, vfour, amp).items():
+                        pairs = y[ok] * 4 + logits.argmax(dim=1)[ok]
+                        key = named(model, check)
+                        if key not in conf:
+                            conf[key] = torch.zeros(4, 4, dtype=torch.long, device=device)
+                        conf[key] += torch.bincount(pairs, minlength=16).view(4, 4)
         found[camera[0]] = {}
         for model, m in conf.items():
             six = np.zeros((6, 4), np.int64)
@@ -600,11 +700,15 @@ def cameras(
 
 
 def group_of(model: str) -> str:
-    """seed0/real -> Clarity real; seed1/fixed -> U-Net fixed bands; ocm4 -> OmniCloudMask."""
+    """seed0/real -> Clarity real; seed1/fixed -> U-Net fixed bands; ocm4 -> OmniCloudMask;
+    seed0/sim@shuffled -> Clarity sim [shuffled]."""
+    model, _, check = model.partition("@")
     if "/" in model:
         arm = model.rsplit("/", 1)[1]
-        return ARM_TITLES.get(arm, f"Clarity {arm}")
-    return OCM.get(model, model)
+        title = ARM_TITLES.get(arm, f"Clarity {arm}")
+    else:
+        title = OCM.get(model, model)
+    return f"{title} [{check}]" if check else title
 
 
 def cell(values: list[float]) -> str:
@@ -622,12 +726,12 @@ def table(per_model: dict[str, dict]) -> list[str]:
     groups: dict[str, list[dict]] = {}
     for model, s in per_model.items():
         groups.setdefault(group_of(model), []).append(s)
-    lines = [f"  {'':<34}" + "".join(f"{h:>14}" for h in HEADS)]
+    lines = [f"  {'':<44}" + "".join(f"{h:>14}" for h in HEADS)]
     for name, members in groups.items():
         cells = [cell([m[k] for m in members]) for k in SHOWN]
         n = len(members)
         seeds = f" ({n} seed{'s' * (n != 1)})" if name not in OCM.values() else ""
-        lines.append(f"  {name + seeds:<34}" + "".join(f"{c:>14}" for c in cells))
+        lines.append(f"  {name + seeds:<44}" + "".join(f"{c:>14}" for c in cells))
     return lines
 
 
@@ -649,8 +753,11 @@ def row(test: str, name: str, scene: str, model: str, size: int, conf, s: dict, 
     return out | {"shadow_ok": ok, "pixels": pixels, "confusion": flat} | s
 
 
-def score_set(ts: SceneSet, classify, maps: Path | None = None) -> tuple[list[dict], list[str]]:
-    """One set's rows for the CSV and its printed lines."""
+def score_set(
+    ts: SceneSet, classify, maps: Path | None = None, cards=("honest",)
+) -> tuple[list[dict], list[str]]:
+    """One set's rows for the CSV and its printed lines; every model under every card check
+    (named <model>@<check>), each scene read once."""
     every: dict[str, np.ndarray] = {}
     shadowed: dict[str, np.ndarray] = {}
     rows, counted, shadow_scenes, began = [], 0, 0, time.perf_counter()
@@ -659,7 +766,11 @@ def score_set(ts: SceneSet, classify, maps: Path | None = None) -> tuple[list[di
             print(f"  {ts.test} {item.name}: no pixel to score, left out", flush=True)
             continue
         started = time.perf_counter()
-        preds = predict(classify, item) | item.others
+        preds = {}
+        for check in cards:
+            found = predict(checked(classify, check), item)
+            preds |= {named(model, check): p for model, p in found.items()}
+        preds |= item.others
         counted += 1
         shadow_scenes += item.shadow_ok
         for model, pred in preds.items():
@@ -681,7 +792,7 @@ def score_set(ts: SceneSet, classify, maps: Path | None = None) -> tuple[list[di
             )
         if maps is not None:
             maps.mkdir(parents=True, exist_ok=True)
-            arrays = {m.replace("/", "_"): p for m, p in preds.items()}
+            arrays = {m.replace("/", "_"): p for m, p in preds.items() if "@" not in m}
             picture, k = true_colour(item, ts.rgb)
             path = maps / f"{ts.name}__{item.name}.npz"
             np.savez_compressed(path, label=item.label, rgb=picture, step=k, **arrays)
@@ -735,9 +846,14 @@ def camera_lines(found: dict, size: int = TILE) -> tuple[list[dict], list[str]]:
     for title, cameras in groups:
         if not cameras:
             continue
-        models = per_camera[cameras[0]]
+        models = dict.fromkeys(m for c in cameras for m in per_camera[c])
         mean = {
-            model: {k: float(np.mean([per_camera[c][model][k] for c in cameras])) for k in SHOWN}
+            model: {
+                k: float(
+                    np.mean([per_camera[c][model][k] for c in cameras if model in per_camera[c]])
+                )
+                for k in SHOWN
+            }
             for model in models
         }
         lines.append(f" {title}:")
@@ -761,19 +877,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--ocm", action="store_true", help="OmniCloudMask on Landsat 8 and 7 too")
     p.add_argument("--out", type=Path, help="the CSV (default: see above)")
     p.add_argument("--maps", type=Path, help="keep every scene's predictions here (.npz)")
+    p.add_argument(
+        "--cards", nargs="+", default=["honest"], choices=list(CARDS), help="card checks (above)"
+    )
     args = p.parse_args(argv)
     if args.a_size <= 0 or args.a_size % 24:
         p.error("--a-size must be a multiple of 24: of 8 at 10 m and at 30 m")
     return args
 
 
-def default_out(runs, tests, ocm: bool) -> Path:
-    """In the (last) RUNS folder: clarity_tests.csv for the six tests,
-    clarity_tests_<tests>[_ocm].csv otherwise."""
+def default_out(runs, tests, ocm: bool, cards=("honest",)) -> Path:
+    """In the (last) RUNS folder: clarity_tests.csv for the six tests, plainly told,
+    clarity_tests_<tests>[_ocm][_cards].csv otherwise."""
     folder = Path(runs if isinstance(runs, str | Path) else runs[-1])
-    if set(tests) == set(TESTS) and not ocm:
+    checks = list(cards) != ["honest"]
+    if set(tests) == set(TESTS) and not ocm and not checks:
         return folder / "clarity_tests.csv"
-    return folder / f"clarity_tests_{''.join(sorted(tests))}{'_ocm' if ocm else ''}.csv"
+    more = ("_ocm" if ocm else "") + ("_cards" if checks else "")
+    return folder / f"clarity_tests_{''.join(sorted(tests))}{more}.csv"
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -785,8 +906,10 @@ def main(argv: list[str] | None = None) -> None:
     torch.backends.cudnn.benchmark = True
     nets = load_runs(args.runs, device)
     tests = [t for t in TESTS if t in args.tests]
-    out = args.out or default_out(args.runs, tests, args.ocm)
+    out = args.out or default_out(args.runs, tests, args.ocm, args.cards)
     print(f"{len(nets)} networks ({', '.join(nets)}) on {device}; tests {' '.join(tests)}")
+    if args.cards != ["honest"]:
+        print(f"card checks: {', '.join(args.cards)}", flush=True)
     started, rows, report = time.perf_counter(), [], []
 
     def keep(more: list[dict], lines: list[str]) -> None:
@@ -800,7 +923,15 @@ def main(argv: list[str] | None = None) -> None:
         chips = args.data / "chips" / "cloudsen12plus"
         if (chips / "index.csv").exists():
             found = cameras(
-                nets, chips, args.windows, args.a_size, device, amp, args.workers, args.batch
+                nets,
+                chips,
+                args.windows,
+                args.a_size,
+                device,
+                amp,
+                args.workers,
+                args.batch,
+                args.cards,
             )
             keep(*camera_lines(found, args.a_size))
         else:
@@ -809,7 +940,7 @@ def main(argv: list[str] | None = None) -> None:
     ocm = (lambda r, g, n: omnicloudmask(r, g, n, device)) if args.ocm else None
     for ts in scene_sets(args.data, [t for t in tests if t != "A"], ocm):
         try:
-            keep(*score_set(ts, classify, args.maps))
+            keep(*score_set(ts, classify, args.maps, args.cards))
         except Exception:  # one broken set must not cost the others
             traceback.print_exc()
             print(f"test {ts.test}: {ts.name} stopped by the error above; the rest go on")
