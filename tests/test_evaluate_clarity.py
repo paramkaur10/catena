@@ -361,6 +361,21 @@ def test_card_checks():
         E.vary("lies", x, told, rgbn)
 
 
+def test_what_sensei_is_told():
+    told = np.zeros((2, desc.N_CHAIN_CARD), np.float32)
+    told[:, [0, 2]] = [[desc.wavelength_code(645.5), desc.wavelength_code(684.5)]] * 2
+    told[1, [0, 2]] = [desc.wavelength_code(1541.0), desc.wavelength_code(1683.0)]
+    found = E.sensei_descriptors(told)
+    assert found[0] == {
+        "band_type": "TOA Reflectance",
+        "min_wavelength": 645.5,
+        "max_wavelength": 684.5,
+    }
+    assert found[1]["min_wavelength"] == 1541.0 and found[1]["max_wavelength"] == 1683.0
+    assert E.SENSEI_CODES[[0, 1, 2, 3]].tolist() == [0, 2, 1, 3]  # clear, thick, thin, shadow
+    assert E.group_of("sensei2") == "SEnSeIv2"
+
+
 # --- the sets -------------------------------------------------------------------------------
 
 
@@ -437,6 +452,16 @@ def test_scoring_a_set(data, tmp_path):
     assert any("[shuffled]" in line for line in lines)
     kept = np.load(tmp_path / "checked" / f"eaglet2__{EAGLET}.npz")
     assert not any("@" in k for k in kept.files)  # the maps: honest only
+
+    def extra(item):  # another model's classes of each scene, as SEnSeIv2's run gives them
+        rho = E.whole_scene(item)
+        assert rho.shape == item.image.shape and rho.dtype == np.float32
+        return {"sensei2": np.full(item.label.shape, 2, np.uint8)}
+
+    rows, lines = E.score_set(sets["eaglet2"], fake(30), tmp_path / "more", extra=extra)
+    mine = next(r for r in rows if r["model"] == "sensei2" and r["scene"] == "all")
+    assert mine["cloud_recall"] == 1.0 and any("SEnSeIv2  " in line for line in lines)
+    assert "sensei2" in np.load(tmp_path / "more" / f"eaglet2__{EAGLET}.npz").files
 
 
 # --- the command (torch) ----------------------------------------------------------------
@@ -554,6 +579,8 @@ def test_default_out(tmp_path):
     assert E.default_out(tmp_path, list(E.TESTS), False) == tmp_path / "clarity_tests.csv"
     checks = ["honest", "shuffled"]
     assert E.default_out(tmp_path, ["A", "C"], False, checks).name == "clarity_tests_AC_cards.csv"
+    found = E.default_out(tmp_path, ["B", "C"], True, ["honest"], True)
+    assert found.name == "clarity_tests_BC_ocm_sensei.csv"
     two = [tmp_path / "big", tmp_path / "arms"]
     assert E.default_out(two, list(E.TESTS), False) == tmp_path / "arms" / "clarity_tests.csv"
     assert E.default_out(tmp_path, ["E", "D"], False).name == "clarity_tests_DE.csv"

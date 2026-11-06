@@ -81,13 +81,18 @@ def pynas() -> SimpleNamespace:
     """PyNAS's modules, set to read Catena's search space (catena/pynas.ini)."""
     if not _PYNAS:
         os.environ["PYNAS_CONFIG"] = str(CONFIG)
-        from pynas.core import architecture_builder, generic_unet, population
+        from pynas.core import architecture_builder, config, generic_unet, population
 
         architecture_builder._load_config.cache_clear()  # in case PyNAS read its own already
         generic_unet._load_config.cache_clear()
         population.single_point_crossover = crossover
         _PYNAS.append(
-            SimpleNamespace(builder=architecture_builder, unet=generic_unet, population=population)
+            SimpleNamespace(
+                builder=architecture_builder,
+                unet=generic_unet,
+                population=population,
+                config=config,
+            )
         )
     return _PYNAS[0]
 
@@ -327,7 +332,8 @@ class Trainer:
 
 def search_class():
     """PyNAS's Population, given Catena's candidates and fitness."""
-    population = pynas().population
+    found = pynas()
+    population = found.population
 
     class Search(population.Population):
         """The population of trunks behind one head."""
@@ -344,6 +350,7 @@ def search_class():
                 max_parameters=budget,
                 save_directory=str(out),
             )
+            self.cfg = found.config.load_config(CONFIG)  # what it prints: fp32, as trained here
 
         def setup_logger(self, *_args, **_kwargs):
             """PyNAS's log, in OUT (PyNAS writes ../logs/population.log)."""

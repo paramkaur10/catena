@@ -2,8 +2,8 @@
 test the method) on six test sets, beside OmniCloudMask wherever its predictions exist.
 
     python -m catena.evaluate_clarity RUNS [RUNS ...] [--data /root/catena_data]
-        [--tests A B C D E F] [--device cuda:0] [--windows 800] [--ocm] [--maps DIR] [--out CSV]
-        [--cards honest shuffled "pixel x3" ...]
+        [--tests A B C D E F] [--device cuda:0] [--windows 800] [--ocm] [--sensei] [--maps DIR]
+        [--out CSV] [--cards honest shuffled "pixel x3" ...]
 
 Each RUNS folder holds finished runs (final.pt) at any depth, one folder per seed, as
 scripts/big.sh makes them (runs/big/seed0, or runs/arms/chain/seed0 for OUT=runs/arms/chain);
@@ -45,6 +45,13 @@ result. With --ocm, OmniCloudMask also runs on Landsat 8 and Landsat 7 (B, C), a
 the drafts (model 4.0 on red, green and near infrared): labels that do not come from it, on a
 satellite (Landsat 7) neither model trained on, so an even comparison.
 
+SEnSeIv2 (--sensei; Francis et al., IEEE TGRS 2024; senseiv2, installed from its repository):
+its sensor-independent model (SEnSeIv2-SegFormerB2-alldata-ambiguous, from Hugging Face) on
+every scene of B-F, as its own CloudMask runs it (patches of its size, overlapping by half),
+told each band's edges as our cards state them and its type, top-of-atmosphere reflectance
+(the only optical type it knows: PeruSat-1's surface reflectance is told so too). Its four
+classes (clear, thick, thin, shadow) are put in Catena's codes. Not on Test A's windows.
+
 Scores pool the pixels of a set: cloud (thin or thick) against not cloud, as F1 and balanced
 accuracy, and the F1 of thin and of thick cloud, over every scene; the F1 of clear and of
 shadow, the mean F1 of the four classes and the accuracy over the scenes whose shadows were
@@ -76,8 +83,8 @@ wrong, and should hold up when bands go missing. Its rows are named <model>@<che
   rgb only          only blue, green and red kept; the fixed arm has nothing to read
   noise x3          the noise told 3 times larger where it is known (the chain arm reads it)
   blur x2           the blur told twice as wide where it is known
-Without --out, a run with checks other than honest writes clarity_tests_<tests>[_ocm]_cards.csv;
-the maps (--maps) keep the honest predictions only.
+Without --out, a run with checks other than honest writes clarity_tests_<tests>[_ocm]_cards.csv
+(and with SEnSeIv2, _sensei before .csv); the maps (--maps) keep the honest predictions only.
 """
 
 from __future__ import annotations
@@ -131,6 +138,9 @@ OCM = {
     "ocm4_nirblue": "OmniCloudMask, NIR from blue",
     "ocm4_nirzeros": "OmniCloudMask, NIR zeros",
 }
+BASELINES = OCM | {"sensei2": "SEnSeIv2"}  # other models, by the name of their predictions
+SENSEI_MODEL = "SEnSeIv2-SegFormerB2-alldata-ambiguous"
+SENSEI_CODES = np.array([0, 2, 1, 3], np.uint8)  # its clear, thick, thin, shadow in our codes
 
 
 def same(x: np.ndarray) -> np.ndarray:
@@ -381,6 +391,46 @@ def omnicloudmask(red: np.ndarray, green: np.ndarray, nir: np.ndarray, device) -
     classes = classes.astype(np.uint8)
     classes[(red <= 0) & (green <= 0)] = NO_LABEL
     return viz.FROM_OCM[classes]
+
+
+def sensei_descriptors(told: np.ndarray) -> list[dict]:
+    """SEnSeIv2's band descriptors from chain cards (bands, 11): each band's edges in nm
+    (wavelength codes are log(nm - 300) - 2) and its type, top-of-atmosphere reflectance."""
+    nm = np.exp(np.asarray(told, np.float64)[:, [0, 2]] + 2.0) + 300.0
+    kind = "TOA Reflectance"
+    return [
+        {
+            "band_type": kind,
+            "min_wavelength": round(float(lo), 1),
+            "max_wavelength": round(float(hi), 1),
+        }
+        for lo, hi in nm
+    ]
+
+
+def sensei(device, batch_size: int = 4):
+    """SEnSeIv2's sensor-independent model as its CloudMask runs it: run(rho (bands, H, W),
+    told (bands, 11)) -> classes (H, W) in Catena's codes. Downloads the model the first
+    time (Hugging Face, aliFrancis/SEnSeIv2)."""
+    from senseiv2.inference import CloudMask
+    from senseiv2.utils import get_model_files
+
+    config, weights = get_model_files(SENSEI_MODEL)
+    settings = {"output_style": "4-class", "categorise": True, "batch_size": batch_size}
+    mask = CloudMask(config, weights, device=str(device), **settings)
+    stride = int(mask.model_config["PATCH_SIZE"]) // 2
+
+    def run(rho: np.ndarray, told: np.ndarray) -> np.ndarray:
+        rho = np.ascontiguousarray(rho, np.float32)
+        classes = mask(rho, descriptors=sensei_descriptors(told), stride=stride)
+        return SENSEI_CODES[np.asarray(classes).astype(np.int64)]
+
+    return run
+
+
+def whole_scene(item: Item) -> np.ndarray:
+    """An item's reflectance, all of it (bands, H, W) float32."""
+    return item.to_rho(np.ascontiguousarray(item.image[None]))[0].astype(np.float32)
 
 
 def some_bands(module, scene, dn: np.ndarray, bands, rows: int = 1024) -> np.ndarray:
@@ -707,7 +757,7 @@ def group_of(model: str) -> str:
         arm = model.rsplit("/", 1)[1]
         title = ARM_TITLES.get(arm, f"Clarity {arm}")
     else:
-        title = OCM.get(model, model)
+        title = BASELINES.get(model, model)
     return f"{title} [{check}]" if check else title
 
 
@@ -730,7 +780,7 @@ def table(per_model: dict[str, dict]) -> list[str]:
     for name, members in groups.items():
         cells = [cell([m[k] for m in members]) for k in SHOWN]
         n = len(members)
-        seeds = f" ({n} seed{'s' * (n != 1)})" if name not in OCM.values() else ""
+        seeds = f" ({n} seed{'s' * (n != 1)})" if name not in BASELINES.values() else ""
         lines.append(f"  {name + seeds:<44}" + "".join(f"{c:>14}" for c in cells))
     return lines
 
@@ -754,10 +804,11 @@ def row(test: str, name: str, scene: str, model: str, size: int, conf, s: dict, 
 
 
 def score_set(
-    ts: SceneSet, classify, maps: Path | None = None, cards=("honest",)
+    ts: SceneSet, classify, maps: Path | None = None, cards=("honest",), extra=None
 ) -> tuple[list[dict], list[str]]:
     """One set's rows for the CSV and its printed lines; every model under every card check
-    (named <model>@<check>), each scene read once."""
+    (named <model>@<check>), each scene read once; extra(item) -> {name: classes}, other
+    models' predictions of each scene (SEnSeIv2)."""
     every: dict[str, np.ndarray] = {}
     shadowed: dict[str, np.ndarray] = {}
     rows, counted, shadow_scenes, began = [], 0, 0, time.perf_counter()
@@ -771,6 +822,8 @@ def score_set(
             found = predict(checked(classify, check), item)
             preds |= {named(model, check): p for model, p in found.items()}
         preds |= item.others
+        if extra is not None:
+            preds |= extra(item)
         counted += 1
         shadow_scenes += item.shadow_ok
         for model, pred in preds.items():
@@ -875,6 +928,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--workers", type=int, default=6, help="Test A: data-loading processes")
     p.add_argument("--device", help="default cuda:0 if there is a GPU, else cpu")
     p.add_argument("--ocm", action="store_true", help="OmniCloudMask on Landsat 8 and 7 too")
+    p.add_argument("--sensei", action="store_true", help="SEnSeIv2 on the scenes of B-F")
+    p.add_argument("--sensei-batch", type=int, default=4, help="SEnSeIv2's patches per batch")
     p.add_argument("--out", type=Path, help="the CSV (default: see above)")
     p.add_argument("--maps", type=Path, help="keep every scene's predictions here (.npz)")
     p.add_argument(
@@ -886,14 +941,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def default_out(runs, tests, ocm: bool, cards=("honest",)) -> Path:
+def default_out(runs, tests, ocm: bool, cards=("honest",), sensei: bool = False) -> Path:
     """In the (last) RUNS folder: clarity_tests.csv for the six tests, plainly told,
-    clarity_tests_<tests>[_ocm][_cards].csv otherwise."""
+    clarity_tests_<tests>[_ocm][_cards][_sensei].csv otherwise."""
     folder = Path(runs if isinstance(runs, str | Path) else runs[-1])
     checks = list(cards) != ["honest"]
-    if set(tests) == set(TESTS) and not ocm and not checks:
+    if set(tests) == set(TESTS) and not ocm and not checks and not sensei:
         return folder / "clarity_tests.csv"
-    more = ("_ocm" if ocm else "") + ("_cards" if checks else "")
+    more = ("_ocm" if ocm else "") + ("_cards" if checks else "") + ("_sensei" if sensei else "")
     return folder / f"clarity_tests_{''.join(sorted(tests))}{more}.csv"
 
 
@@ -906,7 +961,7 @@ def main(argv: list[str] | None = None) -> None:
     torch.backends.cudnn.benchmark = True
     nets = load_runs(args.runs, device)
     tests = [t for t in TESTS if t in args.tests]
-    out = args.out or default_out(args.runs, tests, args.ocm, args.cards)
+    out = args.out or default_out(args.runs, tests, args.ocm, args.cards, args.sensei)
     print(f"{len(nets)} networks ({', '.join(nets)}) on {device}; tests {' '.join(tests)}")
     if args.cards != ["honest"]:
         print(f"card checks: {', '.join(args.cards)}", flush=True)
@@ -938,9 +993,16 @@ def main(argv: list[str] | None = None) -> None:
             print(f"test A left out: no {chips / 'index.csv'}", flush=True)
     classify = classifier(nets, device, amp)
     ocm = (lambda r, g, n: omnicloudmask(r, g, n, device)) if args.ocm else None
+    extra = None
+    if args.sensei:
+        run_sensei = sensei(device, args.sensei_batch)
+
+        def extra(item: Item) -> dict:
+            return {"sensei2": run_sensei(whole_scene(item), item.told)}
+
     for ts in scene_sets(args.data, [t for t in tests if t != "A"], ocm):
         try:
-            keep(*score_set(ts, classify, args.maps, args.cards))
+            keep(*score_set(ts, classify, args.maps, args.cards, extra))
         except Exception:  # one broken set must not cost the others
             traceback.print_exc()
             print(f"test {ts.test}: {ts.name} stopped by the error above; the rest go on")
