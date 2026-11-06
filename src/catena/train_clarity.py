@@ -1,21 +1,40 @@
-"""The big run: Clarity trained on four satellites, in two versions side by side.
+"""The big run: Clarity trained on four satellites, two arms side by side.
 
     python -m catena.train_clarity OUT [--data /root/catena_data] [--seed 0] [--steps 60000]
-        [--shares 0.4 0.2 0.2 0.2] [--devices cuda:0 cuda:1]
+        [--arms real sim] [--shares 0.4 0.2 0.2 0.2] [--devices cuda:0 cuda:1]
         [--q-weights 1 1 1] [--faults 0] [--fault-gain 0.3] [--fault-nir 0.4]
+        [--chain-jitter 1]
 
 Clarity reads, for each band, only what every product states (catena.descriptor.card): its
 wavelengths, surface or top-of-atmosphere reflectance, the band's pixel size against the
 grid's, and the grid's pixel size on the ground. Nothing about the imaging chain.
 
-The two versions, one per GPU, start from the same weights and see the same windows in the
-same order, with the same bands and gains:
-  real   every sample as its satellite delivered it;
-  sim    the same, except that 80% of the Sentinel-2 samples are re-imaged by a made-up
-         camera (catena.sim): 30 or 50 m pixels, or 10 m, with more blur and noise, fewer
-         bits and a saturation from 0.25 to 1.6. These are the same Sentinel-2 windows and
-         labels, processed: no new images and no new labels.
-So the two differ only in the made-up cameras. Two options change the sim version only:
+Two arms (--arms), one per device (--devices, in the same order), see the same windows in the
+same order, with the same bands and gains; arms of one design start from the same weights.
+The first big run's two, the default:
+  real    every sample as its satellite delivered it; the card;
+  sim     the same, except that 80% of the Sentinel-2 samples are re-imaged by a made-up
+          camera (catena.sim): 30 or 50 m pixels, or 10 m, with more blur and noise, fewer
+          bits and a saturation from 0.25 to 1.6. These are the same Sentinel-2 windows and
+          labels, processed: no new images and no new labels.
+The arms that test the method learn from sim's samples and differ from it only in what they
+read:
+  sensei  the card without its pixel sizes: the wavelengths, and surface or top of
+          atmosphere; what SEnSeIv2 is told (a band's type and edges);
+  chain   the chain card (catena.descriptor.chain_card): the card, then what the MTF and the
+          SNR say where they are known (Sentinel-2's spec, the made-up cameras, Landsat 8's
+          noise), with descriptor dropout (catena.descriptor.hide) and errors the size real
+          specs carry (--chain-jitter, catena.descriptor.jitter), so it copes where they
+          are unknown or roughly right;
+  blind   nothing: every band's card is zeros, so it cannot tell one band from another;
+  fixed   no band encoder: catena.model.FixedBands, the U-Net on blue, green, red and near
+          infrared in that order, as a network made for one band set; the same windows,
+          pixel sizes and made-up cameras or not as sim, but always these four bands, with
+          gains and a camera of their own.
+With the same seed every arm sees what the first big run's sim version saw: what an arm adds
+(its four bands, dropout and errors) is drawn from random streams of its own.
+
+So real and sim differ only in the made-up cameras. Two options change sim's samples only:
   --q-weights  how often its Sentinel-2 samples get 10, 30 and 50 m pixels (default 1 1 1:
                each a third; 0.5 0.3 0.2 gives 10 m half the time, so 70% are made up);
   --faults     the share of its samples, from every satellite, given a calibration fault
@@ -39,22 +58,24 @@ all its bands, between 0.7 and 1.5, as CloudPeru2's scale is not documented.
 Loss, optimiser and validation as in catena.train: the partial-label cross-entropy (a cloud
 of unknown thickness counts as thin or thick, not cloud as clear or shadow), AdamW with a
 warm-up and a cosine decay, float32 weights with bf16 sums on the GPU (--no-amp: float32
-throughout), and validation on the 6 cameras of the CloudSEN12+ validation split.
+throughout), and validation on the 6 cameras of the CloudSEN12+ validation split, with the
+honest chain cards (the fixed arm: each camera's blue, green, red and B08, or B8A without it).
 
-OUT receives config.json, metrics.jsonl, last.pt (both versions with their optimisers and
-schedules, at every validation) and final.pt. After a stop, the same command goes on from
-last.pt, with the same samples it would have drawn; a finished run is never touched.
+OUT receives config.json, metrics.jsonl, last.pt (both arms with their optimisers and
+schedules, at every validation) and final.pt, which lists each arm's design (arms). After a
+stop, the same command goes on from last.pt, with the same samples it would have drawn; a
+finished run is never touched.
 """
 
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import math
 import platform
 import time
 from collections import Counter
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -66,9 +87,9 @@ from catena import descriptor as desc
 from catena import sim
 from catena import train as T
 from catena.data import biome, heo, loader, perusat
-from catena.model import Clarity, count_parameters
+from catena.model import Clarity, FixedBands, count_parameters
 
-VERSIONS = ("real", "sim")
+VERSIONS = ("real", "sim")  # the first big run's arms, the default
 SOURCES = ("sentinel2", "landsat8", "heo", "perusat1")
 SHARES = (0.4, 0.2, 0.2, 0.2)
 TOPS = (0.25, 1.6)  # the made-up cameras' saturation, in reflectance
@@ -81,26 +102,75 @@ NIR_LEAK = {  # per satellite: the visible bands a fault mixes near infrared int
     "heo": ((1, 2, 3), 7),  # B01-B03; B07
     "perusat1": ((0, 1, 2), 3),  # blue, green, red; nir
 }
-# what a resumed run must share with the run it goes on from
+RGBN = {  # where blue, green, red and near infrared sit among each satellite's bands
+    "sentinel2": (1, 2, 3, 7),  # B02, B03, B04, B08
+    "landsat8": (1, 2, 3, 4),  # B2, B3, B4, B5
+    "heo": (1, 2, 3, 7),  # B01, B02, B03, B07
+    "perusat1": (0, 1, 2, 3),
+}
+# what a resumed run must share with the run it goes on from; a setting older runs did not
+# write counts as its default (OLDER)
 SAME_ARGS = ("seed", "steps", "batch", "size", "landsat_size", "heo_size", "perusat_size")
 SAME_ARGS += ("shares", "p_s2", "widths", "stem", "lr", "weight_decay", "warmup", "hold_out")
-SAME_ARGS += ("q_weights", "faults", "fault_gain", "fault_nir")
+SAME_ARGS += ("q_weights", "faults", "fault_gain", "fault_nir", "arms", "chain_jitter")
+OLDER = {"q_weights": [1.0, 1.0, 1.0], "faults": 0.0, "fault_gain": 0.3, "fault_nir": 0.4}
+OLDER |= {"arms": list(VERSIONS), "chain_jitter": 1.0}
+
+
+@dataclass(frozen=True)
+class Arm:
+    """What an arm learns from and reads: data, the samples ("real" or "sim"); fields, how
+    many numbers of each band's chain card its Clarity reads (0: FixedBands, no card at all);
+    blind, its cards are zeros."""
+
+    data: str
+    fields: int
+    blind: bool = False
+
+
+ARMS = {
+    "real": Arm("real", desc.N_CARD),
+    "sim": Arm("sim", desc.N_CARD),
+    "sensei": Arm("sim", 4),  # lo, mid, hi, surface
+    "chain": Arm("sim", desc.N_CHAIN_CARD),
+    "blind": Arm("sim", desc.N_CARD, blind=True),
+    "fixed": Arm("sim", 0),
+}
+
+
+def build(name: str, widths, stem: int) -> torch.nn.Module:
+    """An arm's network, its weights drawn from torch's generator as it stands."""
+    if ARMS[name].fields == 0:
+        return FixedBands(widths=tuple(widths), stem=stem)
+    return Clarity(widths=tuple(widths), stem=stem, fields=ARMS[name].fields)
+
+
+def rgbn_slots(names) -> list[int]:
+    """Where blue, green, red and near infrared sit among a Sentinel-2 camera's bands: B02,
+    B03, B04, and B08, or B8A where there is no B08."""
+    names = list(names)
+    nir = "B08" if "B08" in names else "B8A"
+    return [names.index(b) for b in ("B02", "B03", "B04", nir)]
 
 
 def pack(x: np.ndarray, d: np.ndarray, real: np.ndarray, label: np.ndarray) -> dict:
-    return {"image": x, "card": desc.card(d), "real": real, "label": label}
+    return {"image": x, "desc": d, "real": real, "label": label}
 
 
 class Samples(Dataset):
-    """Training samples for both versions. Sample i depends only on the seed and i, so a run
+    """Training samples for both arms. Sample i depends only on the seed and i, so a run
     repeats exactly whatever the number of data-loading processes, and goes on exactly after
     a stop: `start` is the first sample, step x batch.
 
-    Each item holds the real version's image (13 slots, the kept bands first), card, band
-    slots and label, and the sim version's image, card and label. same is True when the sim
-    version sees what the real one sees (every batch but Sentinel-2's, unless the sim
-    version gets faults); its own entries are then small placeholders. The real version's
-    samples do not depend on q_weights and faults: everything it sees is drawn first."""
+    Each item holds the real version's image (13 slots, the kept bands first), chain card
+    (told), band slots and label; the sim version's image, chain card (sim_told, with
+    descriptor dropout and errors, which touch only its MTF and SNR numbers) and label; and,
+    with fixed, the fixed arm's blue, green, red and near infrared (fixed_image) on the sim
+    version's grid. same is True when the sim version sees what the real one sees (every
+    batch but Sentinel-2's, unless the sim version gets faults); its own image and label are
+    then small placeholders. The real version's samples do not depend on q_weights, faults,
+    fixed or chain_jitter, and the sim version's images not on fixed or chain_jitter: they
+    are drawn first, and the rest from random streams of its own."""
 
     def __init__(
         self,
@@ -119,6 +189,8 @@ class Samples(Dataset):
         faults: float = 0.0,
         fault_gain: float = 0.3,
         fault_nir: float = 0.4,
+        fixed: bool = False,
+        chain_jitter: float = 1.0,
     ) -> None:
         self.windows, self.batch, self.seed = windows, batch, seed
         self.data = {"landsat8": landsat, "heo": heo_windows, "perusat1": peru}
@@ -135,6 +207,9 @@ class Samples(Dataset):
             if not np.allclose(w, w[0]):  # equal weights: the draw of the first big run
                 self.q_weights = w / w.sum()
         self.faults, self.fault_gain, self.fault_nir = faults, fault_gain, fault_nir
+        if fixed and faults > 0:
+            raise ValueError("the fixed arm takes no faults")
+        self.fixed, self.chain_jitter = fixed, chain_jitter
 
     def faulty(self, x: np.ndarray, source: str, rng: np.random.Generator) -> np.ndarray | None:
         """Every band of a sample with a calibration fault, for the sim version, or None when
@@ -163,7 +238,16 @@ class Samples(Dataset):
         keep = np.sort(rng.choice(total, n, replace=False))
         return keep, rng.uniform(1 - self.gain, 1 + self.gain, n)
 
-    def from_sentinel2(self, i: int, rng: np.random.Generator) -> dict:
+    def four_bands(self, rho: np.ndarray, source: str, frng, gain: float = 1.0):
+        """The fixed arm's blue, green, red and near infrared of a sample as delivered, with
+        gains of its own (frng), or None without the fixed arm."""
+        if frng is None:
+            return None
+        four = rho[list(RGBN[source])]
+        gains = gain * frng.uniform(1 - self.gain, 1 + self.gain, len(four))
+        return (four * gains[:, None, None]).astype(np.float32)
+
+    def from_sentinel2(self, i: int, rng: np.random.Generator, frng=None) -> dict:
         s = self.windows[i]  # drawn, turned and flipped by the loader
         keep, gains = self.bands(N_BANDS, rng)
         scene = (s["image"], s["label"], s["sun_zenith"])
@@ -178,13 +262,22 @@ class Samples(Dataset):
             x, d, _, label = T.render(
                 image, s["label"], s["sun_zenith"], q, keep, camera, rng, gains
             )
-        return out | {"sim_image": x, "sim_card": desc.card(d), "sim_label": label, "same": False}
+        out |= {"sim_image": x, "sim_desc": d, "sim_label": label, "same": False}
+        if frng is not None:  # the fixed arm's four bands, made up or not as sim's
+            four = np.array(RGBN["sentinel2"])
+            gains = frng.uniform(1 - self.gain, 1 + self.gain, len(four))
+            camera = sim.imagine_camera(frng, len(four), q, tops=TOPS)[1] if made_up else None
+            x, *_ = T.render(*scene, q, four, camera, frng, gains)
+            out["fixed_image"] = x[: len(four)]
+        return out
 
-    def as_delivered(self, x: np.ndarray, d: np.ndarray, label, turn: int, sim_x=None) -> dict:
+    def as_delivered(
+        self, x: np.ndarray, d: np.ndarray, label, turn: int, sim_x=None, fixed=None
+    ) -> dict:
         """A sample as its satellite delivered it: given a quarter turn or flip (turn, 0-7),
         its bands in the first slots. Both versions see it alike, unless sim_x, the same bands
         with a fault, is given (or the sim version gets faults at all: then it sees x as its
-        own copy)."""
+        own copy). fixed: the fixed arm's four bands, turned alike."""
         n, size = len(x), x.shape[-1]
         image = np.zeros((N_BANDS, size, size), np.float32)
         image[:n] = loader.dihedral(x, turn)
@@ -193,10 +286,12 @@ class Samples(Dataset):
         real = np.zeros(N_BANDS, bool)
         real[:n] = True
         out = pack(image, descs, real, loader.dihedral(label, turn).astype(np.int64))
+        if fixed is not None:
+            out["fixed_image"] = loader.dihedral(fixed, turn)
         if sim_x is None and self.faults <= 0:
             return out | {
                 "sim_image": np.zeros((N_BANDS, PLACE, PLACE), np.float32),
-                "sim_card": out["card"],
+                "sim_desc": descs,
                 "sim_label": np.zeros((PLACE, PLACE), np.int64),
                 "same": True,
             }
@@ -204,9 +299,7 @@ class Samples(Dataset):
         if sim_x is not None:
             own[:n] = loader.dihedral(sim_x, turn)
         return (
-            out
-            | {"sim_image": own, "sim_card": out["card"], "sim_label": out["label"]}
-            | {"same": False}
+            out | {"sim_image": own, "sim_desc": descs, "sim_label": out["label"]} | {"same": False}
         )
 
     def with_fault(self, rho: np.ndarray, source: str, keep, gains, rng) -> np.ndarray | None:
@@ -214,25 +307,27 @@ class Samples(Dataset):
         bad = self.faulty(rho, source, rng)
         return None if bad is None else bad[keep] * gains[:, None, None]
 
-    def from_landsat8(self, rng: np.random.Generator) -> dict:
+    def from_landsat8(self, rng: np.random.Generator, frng=None) -> dict:
         data = self.data["landsat8"]
         scene, dn, label = data.draw(rng)  # clear is 5 in a scene without shadow labels
         keep, gains = self.bands(len(biome.BANDS), rng)
         rho = biome.reflectance(scene, dn)
         x, turn = rho[keep] * gains[:, None, None], int(rng.integers(8))
         sim_x = self.with_fault(rho, "landsat8", keep, gains, rng)  # drawn after the real's
-        return self.as_delivered(x, data.cards[scene.name][keep], label, turn, sim_x)
+        fixed = self.four_bands(rho, "landsat8", frng)
+        return self.as_delivered(x, data.cards[scene.name][keep], label, turn, sim_x, fixed)
 
-    def from_heo(self, rng: np.random.Generator) -> dict:
+    def from_heo(self, rng: np.random.Generator, frng=None) -> dict:
         data = self.data["heo"]
         _, dn, label = data.draw(rng)
         keep, gains = self.bands(len(heo.BANDS), rng)
         rho = heo.reflectance(dn)
         x, turn = rho[keep] * gains[:, None, None], int(rng.integers(8))
         sim_x = self.with_fault(rho, "heo", keep, gains, rng)
-        return self.as_delivered(x, data.card[keep], label, turn, sim_x)
+        fixed = self.four_bands(rho, "heo", frng)
+        return self.as_delivered(x, data.card[keep], label, turn, sim_x, fixed)
 
-    def from_perusat1(self, rng: np.random.Generator) -> dict:
+    def from_perusat1(self, rng: np.random.Generator, frng=None) -> dict:
         data = self.data["perusat1"]
         _, dn, label = data.draw(rng)
         keep, gains = self.bands(len(perusat.BANDS), rng)
@@ -241,73 +336,101 @@ class Samples(Dataset):
         rho = perusat.reflectance(dn)
         x, turn = rho[keep] * gains[:, None, None], int(rng.integers(8))
         sim_x = self.with_fault(rho, "perusat1", keep, gains, rng)
-        return self.as_delivered(x, data.card[keep], label, turn, sim_x)
+        whole = math.exp(frng.uniform(low, high)) if frng is not None else 1.0
+        fixed = self.four_bands(rho, "perusat1", frng, whole)
+        return self.as_delivered(x, data.card[keep], label, turn, sim_x, fixed)
 
     def __getitem__(self, j: int) -> dict:
         i = self.start + j
         rng = np.random.default_rng([self.seed, 1, i])
+        frng = np.random.default_rng([self.seed, 5, i]) if self.fixed else None
         source = self.source(i)
         if source == "sentinel2":
-            out = self.from_sentinel2(i, rng)
+            out = self.from_sentinel2(i, rng, frng)
         elif source == "landsat8":
-            out = self.from_landsat8(rng)
+            out = self.from_landsat8(rng, frng)
         elif source == "heo":
-            out = self.from_heo(rng)
+            out = self.from_heo(rng, frng)
         else:
-            out = self.from_perusat1(rng)
+            out = self.from_perusat1(rng, frng)
+        n = int(out["real"].sum())
+        drop = np.random.default_rng([self.seed, 4, i])  # the chain arm's dropout and errors
+        hidden = out.pop("sim_desc").copy()
+        hidden[:n] = desc.jitter(desc.hide(hidden[:n], drop), drop, self.chain_jitter)
+        out["told"] = desc.chain_card(out.pop("desc"))
+        out["sim_told"] = desc.chain_card(hidden)
         return out | {"source": SOURCES.index(source)}
 
 
-def version_inputs(batch: dict, version: str) -> tuple:
-    """The image, card and label a version sees in a batch."""
-    if version == "sim" and not bool(batch["same"][0]):
-        return batch["sim_image"], batch["sim_card"], batch["sim_label"]
-    return batch["image"], batch["card"], batch["label"]
+def arm_inputs(batch: dict, name: str) -> tuple:
+    """What an arm sees in a batch: image, chain cards (None for the fixed arm), band slots
+    (None for the fixed arm) and label."""
+    arm = ARMS[name]
+    own = arm.data == "sim" and not bool(batch["same"][0])
+    label = batch["sim_label"] if own else batch["label"]
+    if arm.fields == 0:
+        return batch["fixed_image"], None, None, label
+    image = batch["sim_image"] if own else batch["image"]
+    told = batch["sim_told"] if arm.data == "sim" else batch["told"]
+    if arm.blind:
+        told = torch.zeros_like(told)
+    return image, told, batch["real"], label
 
 
-def forward(net, x, card, real, device: torch.device, amp: bool) -> torch.Tensor:
+def forward(net, x, told, real, device: torch.device, amp: bool) -> torch.Tensor:
     x = x.to(device, non_blocking=True)
-    card = card.to(device, non_blocking=True)
-    real = real.to(device, non_blocking=True)
+    if told is not None:
+        told = told.to(device, non_blocking=True)
+        real = real.to(device, non_blocking=True)
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
-        return net(x, card, real)
+        return net(x, told, real)
 
 
 @torch.no_grad()
 def validate(models: dict, devices: dict, data: DataLoader, amp: dict) -> dict:
-    """Confusion matrices (camera, label, prediction) of both versions on the validation
-    cameras; both see the same images and cards."""
+    """Confusion matrices (camera, label, prediction) of every arm on the validation cameras:
+    the same images and the honest chain cards (blind: zeros; fixed: each camera's blue,
+    green, red and near infrared)."""
     conf = {
-        v: torch.zeros(len(T.VAL_CAMERAS), 4, 4, dtype=torch.long, device=devices[v])
-        for v in VERSIONS
+        a: torch.zeros(len(T.VAL_CAMERAS), 4, 4, dtype=torch.long, device=devices[a])
+        for a in models
     }
     for net in models.values():
         net.eval()
     for batch in data:
         c = int(batch["camera"][0])
-        card = desc.card(batch["d_told"])
-        for v in VERSIONS:
-            logits = forward(models[v], batch["image"], card, batch["real"], devices[v], amp[v])
-            y = batch["label"].to(devices[v], non_blocking=True)
+        told = desc.chain_card(batch["d_told"])
+        four = rgbn_slots(T.VAL_CAMERAS[c][2])
+        for a, net in models.items():
+            if ARMS[a].fields == 0:
+                x, d, real = batch["image"][:, four], None, None
+            else:
+                d = torch.zeros_like(told) if ARMS[a].blind else told
+                x, real = batch["image"], batch["real"]
+            logits = forward(net, x, d, real, devices[a], amp[a])
+            y = batch["label"].to(devices[a], non_blocking=True)
             ok = y < 4
             pairs = y[ok] * 4 + logits.argmax(dim=1)[ok]
-            conf[v][c] += torch.bincount(pairs, minlength=16).view(4, 4)
+            conf[a][c] += torch.bincount(pairs, minlength=16).view(4, 4)
     for net in models.values():
         net.train()
-    return {v: m.cpu().numpy() for v, m in conf.items()}
+    return {a: m.cpu().numpy() for a, m in conf.items()}
 
 
 def save(path: Path, step: int, models: dict, config: dict, opts=None, scheds=None) -> None:
-    """Both versions (with their optimisers and schedules, to go on from), written atomically."""
+    """Both arms (with their optimisers and schedules, to go on from) and their designs,
+    written atomically."""
     state = {
         "step": step,
         "config": config,
         "card": [desc.FIELDS[k] for k in desc.CARD],
-        "models": {v: net.state_dict() for v, net in models.items()},
+        "chain_card": [desc.FIELDS[k] for k in desc.CHAIN_CARD],
+        "arms": {a: asdict(ARMS[a]) for a in models},
+        "models": {a: net.state_dict() for a, net in models.items()},
     }
     if opts is not None:
-        state["optimizers"] = {v: opt.state_dict() for v, opt in opts.items()}
-        state["schedulers"] = {v: s.state_dict() for v, s in scheds.items()}
+        state["optimizers"] = {a: opt.state_dict() for a, opt in opts.items()}
+        state["schedulers"] = {a: s.state_dict() for a, s in scheds.items()}
     tmp = path.with_suffix(".tmp")
     torch.save(state, tmp)
     tmp.replace(path)
@@ -372,6 +495,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--perusat", type=Path, help="CloudPeru2 (default DATA/chips/cloudperu2)")
     p.add_argument("--hold-out", default="pilot", help="the Biome table kept out of training")
     p.add_argument(
+        "--arms",
+        nargs=2,
+        default=list(VERSIONS),
+        choices=list(ARMS),
+        help="the two arms, one per device (default: real sim)",
+    )
+    p.add_argument(
         "--shares",
         type=float,
         nargs=4,
@@ -403,12 +533,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--faults", type=float, default=0.0, help="sim: share of samples with a fault")
     p.add_argument("--fault-gain", type=float, default=0.3, help="a fault's gains: within 1+-x")
     p.add_argument("--fault-nir", type=float, default=0.4, help="a fault's near infrared: up to")
+    p.add_argument(
+        "--chain-jitter", type=float, default=1.0, help="chain: errors of the MTF and SNR, 0-1"
+    )
     p.add_argument("--widths", type=int, nargs=4, default=[32, 64, 128, 256])
     p.add_argument("--stem", type=int, default=16)
     p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--val-every", type=int, default=5000)
     p.add_argument("--val-windows", type=int, default=240, help="windows per validation camera")
-    p.add_argument("--devices", nargs=2, help="the real and the sim version's devices")
+    p.add_argument("--devices", nargs=2, help="the two arms' devices, in --arms order")
     p.add_argument("--no-amp", action="store_true", help="float32 sums instead of bf16")
     p.add_argument("--stop-after", type=int, help="stop at this step and keep last.pt")
     args = p.parse_args(argv)
@@ -423,6 +556,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p.error("--q-weights: none below 0, not all 0")
     if not 0 <= args.faults <= 1 or args.fault_gain < 0 or not 0 <= args.fault_nir < 1:
         p.error("--faults within 0 and 1, --fault-gain from 0, --fault-nir within 0 and 1")
+    if args.arms[0] == args.arms[1]:
+        p.error("--arms: two different arms")
+    if "fixed" in args.arms and args.faults > 0:
+        p.error("--faults: the fixed arm takes none")
+    if args.chain_jitter < 0:
+        p.error("--chain-jitter: 0 or more")
     return args
 
 
@@ -432,7 +571,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"{args.out} already holds a finished run: choose a new folder")
     args.out.mkdir(parents=True, exist_ok=True)
     s2 = args.s2 or args.data / "chips" / "cloudsen12plus"
-    devices = dict(zip(VERSIONS, T.pick_devices(args.devices), strict=True))
+    arms = tuple(args.arms)
+    devices = dict(zip(arms, T.pick_devices(args.devices), strict=True))
     amp = {
         v: dev.type == "cuda" and not args.no_amp and torch.cuda.is_bf16_supported()
         for v, dev in devices.items()
@@ -440,11 +580,10 @@ def main(argv: list[str] | None = None) -> None:
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
 
-    torch.manual_seed(args.seed)
-    first = Clarity(widths=tuple(args.widths), stem=args.stem, fields=desc.N_CARD)
-    models = {"real": first, "sim": copy.deepcopy(first)}  # the same starting weights
-    for v, net in models.items():
-        net.to(devices[v]).train()
+    models = {}
+    for a in arms:
+        torch.manual_seed(args.seed)  # arms of one design start from the same weights
+        models[a] = build(a, args.widths, args.stem).to(devices[a]).train()
     opts = {
         v: torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         for v, net in models.items()
@@ -453,7 +592,7 @@ def main(argv: list[str] | None = None) -> None:
         v: torch.optim.lr_scheduler.LambdaLR(opt, lambda s: T.lr_factor(s, args.warmup, args.steps))
         for v, opt in opts.items()
     }
-    weights = {v: T.CODE_WEIGHTS.to(dev) for v, dev in devices.items()}
+    weights = {a: T.CODE_WEIGHTS.to(dev) for a, dev in devices.items()}
 
     shares = dict(zip(SOURCES, args.shares, strict=True))
     data = {"landsat8": None, "heo": None, "perusat1": None}
@@ -479,13 +618,13 @@ def main(argv: list[str] | None = None) -> None:
     if last.exists():  # going on after a stop
         state = torch.load(last, map_location="cpu")
         before = state["config"]["args"]
-        changed = [k for k in SAME_ARGS if before.get(k) != arguments.get(k)]
+        changed = [k for k in SAME_ARGS if before.get(k, OLDER.get(k)) != arguments.get(k)]
         if changed:
             raise SystemExit(f"{last} was made with other settings: {', '.join(changed)}")
-        for v in VERSIONS:
-            models[v].load_state_dict(state["models"][v])
-            opts[v].load_state_dict(state["optimizers"][v])
-            scheds[v].load_state_dict(state["schedulers"][v])
+        for a in arms:
+            models[a].load_state_dict(state["models"][a])
+            opts[a].load_state_dict(state["optimizers"][a])
+            scheds[a].load_state_dict(state["schedulers"][a])
         step = int(state["step"])
         config = state["config"]
         config.setdefault("resumed", []).append(
@@ -504,8 +643,10 @@ def main(argv: list[str] | None = None) -> None:
                 for v, dev in devices.items()
             },
             "bf16": amp,
-            "parameters": count_parameters(first),
+            "parameters": {a: count_parameters(net) for a, net in models.items()},
+            "arms": {a: asdict(ARMS[a]) for a in arms},
             "card": [desc.FIELDS[k] for k in desc.CARD],
+            "chain_card": [desc.FIELDS[k] for k in desc.CHAIN_CARD],
             "sources": rows,
             "made_up_cameras": {
                 "version": "sim",
@@ -542,6 +683,8 @@ def main(argv: list[str] | None = None) -> None:
         faults=args.faults,
         fault_gain=args.fault_gain,
         fault_nir=args.fault_nir,
+        fixed="fixed" in arms,
+        chain_jitter=args.chain_jitter,
     )
     val_data = T.ValSamples(loader.GridWindows(s2, "validation", size=args.size), args.val_windows)
     pin = any(dev.type == "cuda" for dev in devices.values())
@@ -564,12 +707,16 @@ def main(argv: list[str] | None = None) -> None:
         worker_init_fn=T.quiet,
     )
 
-    parameters = config["parameters"]
-    print(
-        f"Clarity: {parameters:,} parameters, {2 * parameters / 1e6:.1f} MB at float16; real on "
-        f"{devices['real']}, sim on {devices['sim']}; git {config['git']}",
-        flush=True,
-    )
+    print(f"two arms, git {config['git']}", flush=True)
+    for a in arms:
+        n = config["parameters"][a]
+        net = "FixedBands" if ARMS[a].fields == 0 else f"Clarity reading {ARMS[a].fields} numbers"
+        net += ", told nothing" if ARMS[a].blind else ""
+        print(
+            f"  {a:<7}{net}; {ARMS[a].data}'s samples; {n:,} parameters, "
+            f"{2 * n / 1e6:.1f} MB at float16; on {devices[a]}",
+            flush=True,
+        )
     print(f"  {'source':<10}{'data':<52}{'pixel':>7}{'bands':>7}{'share':>7}  labels")
     for r in rows:
         print(
@@ -598,20 +745,20 @@ def main(argv: list[str] | None = None) -> None:
     began, first_step, logged = time.perf_counter(), step, step
     for batch in train_loader:
         counts[SOURCES[int(batch["source"][0])]] += 1
-        for v in VERSIONS:
-            x, card, label = version_inputs(batch, v)
-            logits = forward(models[v], x, card, batch["real"], devices[v], amp[v])
-            loss = T.set_loss(logits, label.to(devices[v], non_blocking=True), weights[v])
-            opts[v].zero_grad(set_to_none=True)
+        for a in arms:
+            x, told, real, label = arm_inputs(batch, a)
+            logits = forward(models[a], x, told, real, devices[a], amp[a])
+            loss = T.set_loss(logits, label.to(devices[a], non_blocking=True), weights[a])
+            opts[a].zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(models[v].parameters(), args.clip)
-            opts[v].step()
-            scheds[v].step()
-            running[v] += loss.detach()
+            torch.nn.utils.clip_grad_norm_(models[a].parameters(), args.clip)
+            opts[a].step()
+            scheds[a].step()
+            running[a] += loss.detach()
         step += 1
 
         if step % args.log_every == 0 or step == args.steps:
-            losses = {v: running[v].item() / (step - logged) for v in VERSIONS}
+            losses = {a: running[a].item() / (step - logged) for a in arms}
             for value in running.values():
                 value.zero_()
             logged = step
@@ -623,14 +770,14 @@ def main(argv: list[str] | None = None) -> None:
                 for v, dev in devices.items()
                 if dev.type == "cuda"
             }
-            lr = scheds["real"].get_last_lr()[0]
+            lr = scheds[arms[0]].get_last_lr()[0]
             entry = {"kind": "train", "step": step, "lr": lr, "s_per_step": round(per_step, 4)}
-            entry |= {f"loss_{v}": round(x, 5) for v, x in losses.items()}
+            entry |= {f"loss_{a}": round(x, 5) for a, x in losses.items()}
             entry |= {"batches": dict(counts), "gpu_gb": memory}
             log.write(json.dumps(entry) + "\n")
+            said = " ".join(f"{a} {x:.4f}" for a, x in losses.items())
             print(
-                f"step {step:,}/{args.steps:,}  loss real {losses['real']:.4f} sim "
-                f"{losses['sim']:.4f}  lr {lr:.2e}  {per_step:.2f} s/step  "
+                f"step {step:,}/{args.steps:,}  loss {said}  lr {lr:.2e}  {per_step:.2f} s/step  "
                 f"{(args.steps - step) * per_step / 3600:.1f} h to go  GPU GB {memory}",
                 flush=True,
             )
@@ -638,18 +785,18 @@ def main(argv: list[str] | None = None) -> None:
         if step % args.val_every == 0 or step == args.steps:
             started = time.perf_counter()
             conf = validate(models, devices, val_loader, amp)
-            for v in VERSIONS:
-                per_camera = [T.scores(conf[v][c]) for c in range(len(T.VAL_CAMERAS))]
+            for a in arms:
+                per_camera = [T.scores(conf[a][c]) for c in range(len(T.VAL_CAMERAS))]
                 for (name, *_), s in zip(T.VAL_CAMERAS, per_camera, strict=True):
-                    entry = {"kind": "val", "step": step, "version": v, "camera": name}
+                    entry = {"kind": "val", "step": step, "version": a, "camera": name}
                     log.write(json.dumps(entry | s) + "\n")
                 mean = {
                     k: round(float(np.mean([s[k] for s in per_camera])), 4) for k in per_camera[0]
                 }
-                entry = {"kind": "val", "step": step, "version": v, "camera": "mean"}
+                entry = {"kind": "val", "step": step, "version": a, "camera": "mean"}
                 log.write(json.dumps(entry | mean) + "\n")
                 print(
-                    f"   validation {v:<4}  F1 clear {mean['f1_clear']:.3f} thin "
+                    f"   validation {a:<6}  F1 clear {mean['f1_clear']:.3f} thin "
                     f"{mean['f1_thin']:.3f} thick {mean['f1_thick']:.3f} shadow "
                     f"{mean['f1_shadow']:.3f}  cloud BA {mean['cloud_ba']:.3f}",
                     flush=True,

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# The big run: Clarity on Sentinel-2, Landsat 8, HEO and PeruSat-1, the versions real and sim
-# side by side (real on cuda:0, sim on cuda:1; catena.train_clarity), seeds 0, 1 and 2, one
-# after the other.
+# The big run: Clarity on Sentinel-2, Landsat 8, HEO and PeruSat-1, two arms side by side
+# (catena.train_clarity; by default the versions real and sim, real on cuda:0, sim on cuda:1),
+# seeds 0, 1 and 2, one after the other.
 #
 #     bash scripts/big.sh                         (inside tmux, from ~/projects/catena)
 #     STEPS=30000 bash scripts/big.sh             (fewer steps per seed)
@@ -11,6 +11,12 @@
 #     OUT=/root/catena_data/runs/big2 SEEDS="3 4 5" bash scripts/big.sh \
 #         --q-weights 0.5 0.3 0.2 --faults 0.5    (the second run: sim with more 10 m and
 #                                                 with calibration faults; real as before)
+#     OUT=/root/catena_data/runs/arms/chain bash scripts/big.sh --arms chain sensei
+#     OUT=/root/catena_data/runs/arms/fixed bash scripts/big.sh --arms fixed blind
+#                                                 (the arms that test the method: the card
+#                                                 with MTF and SNR, and without the pixel
+#                                                 sizes; a U-Net on fixed bands, and the
+#                                                 network told nothing)
 #
 # Each seed writes OUT/seed<N>/ (train.log, config.json, metrics.jsonl, last.pt, final.pt);
 # OUT/big.log says when each seed started, with which options, and how it ended. Start it

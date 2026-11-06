@@ -17,7 +17,11 @@ known values by errors the size real specs carry, so the model does not trust th
 The blind arm (blind) keeps the three wavelength fields, which is what SEnSeI is told, and
 the pixel size on the ground, which every sensor publishes: told and blind differ only in
 the imaging chain. Clarity, the model of the big run, reads the card (card): the wavelength
-fields, surface, sampling and gsd, six facts every product's metadata states.
+fields, surface, sampling and gsd, six facts every product's metadata states. The chain card
+(chain_card) is the card, then what the MTF and the SNR say (the blur, the noise at 0.05 and
+0.5, and whether each is known): 11 numbers, the card first, so a network that reads only
+the first few numbers (the card, or the card without its pixel sizes) reads it too. Bit depth
+and saturation stay out of it.
 
 The step is one level of the bits the camera digitises, over its range up to saturation:
 top / (2^bits - 1). That is the same rule for every camera, simulated or real, whatever
@@ -67,6 +71,9 @@ DARK, BRIGHT = 0.05, 0.5  # the two reflectance levels the noise is told at
 CHAIN = {"psf": ([5], 10), "noise": ([6, 7], 11), "step": ([8], 12), "top": ([9], 13)}
 CARD = (0, 1, 2, 3, 4, GSD)  # lo, mid, hi, surface, sampling, gsd: what Clarity reads
 N_CARD = len(CARD)
+MTF_SNR = (5, 6, 7, 10, 11)  # psf, noise_dark, noise_bright, known_psf, known_noise
+CHAIN_CARD = CARD + MTF_SNR  # the card, then the MTF and the SNR
+N_CHAIN_CARD = len(CHAIN_CARD)
 
 
 def wavelength_code(nm: float) -> float:
@@ -160,6 +167,14 @@ def card(desc):
     the grid's pixel size on the ground. Every product states them; nothing about the imaging
     chain. Takes a numpy array or a torch tensor."""
     return desc[..., list(CARD)]
+
+
+def chain_card(desc):
+    """The card, then what the MTF and the SNR say, (..., 15) -> (..., 11): the card's six
+    numbers, the blur (from the MTF), the noise at reflectance 0.05 and 0.5 (from the SNR),
+    and whether the blur and the noise are known. A value nobody knows is 0 with its flag at 0.
+    Takes a numpy array or a torch tensor."""
+    return desc[..., list(CHAIN_CARD)]
 
 
 def blind(desc: np.ndarray) -> np.ndarray:

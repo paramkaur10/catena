@@ -1,11 +1,14 @@
-"""The tests of the big run: both versions of Clarity (real and sim) of every seed on six test
-sets, beside OmniCloudMask wherever its predictions exist.
+"""The tests of the big run: every arm of every seed (Clarity real and sim, and the arms that
+test the method) on six test sets, beside OmniCloudMask wherever its predictions exist.
 
-    python -m catena.evaluate_clarity RUNS [--data /root/catena_data] [--tests A B C D E F]
-        [--device cuda:0] [--windows 800] [--ocm] [--maps DIR] [--out CSV]
+    python -m catena.evaluate_clarity RUNS [RUNS ...] [--data /root/catena_data]
+        [--tests A B C D E F] [--device cuda:0] [--windows 800] [--ocm] [--maps DIR] [--out CSV]
 
-RUNS holds one folder per seed (seed0, seed1, ...) with final.pt, as scripts/big.sh makes
-them. The tests, by what the networks met in training:
+Each RUNS folder holds finished runs (final.pt) at any depth, one folder per seed, as
+scripts/big.sh makes them (runs/big/seed0, or runs/arms/chain/seed0 for OUT=runs/arms/chain);
+each run brings its two arms (catena.train_clarity), named <seed folder>/<arm>. Two runs that
+bring the same name stop the command: evaluate them apart. The tests, by what the networks
+met in training:
   A  Sentinel-2, seen: the CloudSEN12+ test split through the 23 cameras of catena.evaluate
      (Sentinel-2 as delivered, 18 four-band cameras at 10 and 30 m, 4 beyond the training
      range), --windows windows of --a-size (240) 10 m pixels per camera
@@ -23,9 +26,14 @@ left out, with a note.
 Every scene of B-F is predicted whole, in tiles of the training windows (80 px at 30 m, 240 px
 otherwise) that overlap by twice a margin (10 px at 30 m, 30 px otherwise); each pixel takes
 the tile it lies deepest in. A pixel is scored where it has a label and every band has data
-(CloudPeru2, surface reflectance that can be 0: any band). Clarity reads each band's card
-(catena.descriptor.card): its band edges, surface or top of atmosphere, its pixel against the
-grid's and the grid's pixel on the ground.
+(CloudPeru2, surface reflectance that can be 0: any band). Each network reads what its arm
+reads of each band's chain card (catena.descriptor.chain_card): the card (its band edges,
+surface or top of atmosphere, its pixel against the grid's and the grid's pixel on the
+ground), then what the MTF and the SNR say where they are known (Sentinel-2 and the cameras
+of Test A, Landsat 8's noise); the blind arm reads zeros. The fixed arm reads blue, green, red
+and near infrared in that order: Landsat 8's B2-B5, Landsat 7's B1-B4, HEO's B01-B03 and B07,
+Phi-sat-2's blue, green, red and nir, PeruSat-1's four; Eaglet II has no near infrared band,
+so its blue stands in, as in OmniCloudMask's draft the labels start from (ocm4_nirblue).
 
 OmniCloudMask (D, E): its drafts (scripts/ocm_prelabel.py) are its predictions, scored on the
 same pixels; for Eaglet II both drafts, near infrared filled with blue (ocm4_nirblue, which
@@ -49,8 +57,9 @@ scene (and per set the pooled scores, scene "all"), model and size, with the con
 (6 x 4: rows the label codes 0 clear, 1 thin, 2 thick, 3 shadow, 4 cloud, 5 not cloud; columns
 the predicted class clear, thin, thick, shadow) and the scores. Prints per set the mean and the
 standard deviation over the seeds of each version, and OmniCloudMask. A set that fails is
-reported and skipped. Without --out, the CSV is clarity_tests.csv for all six tests and
-clarity_tests_<tests>[_ocm].csv otherwise, so a partial run never overwrites the full one.
+reported and skipped. Without --out, the CSV goes to the last RUNS folder: clarity_tests.csv
+for all six tests and clarity_tests_<tests>[_ocm].csv otherwise, so a partial run never
+overwrites the full one.
 --maps DIR keeps every scene's predictions, label, OmniCloudMask's classes and true colour,
 one .npz per scene, for pictures (catena.maps, notebooks/results_<dataset>.ipynb).
 """
@@ -75,7 +84,16 @@ from catena import viz
 from catena.data import biome, eaglet2, heo, irish, perusat, phisat2
 from catena.sensors import spec
 
-VERSIONS = ("real", "sim")
+VERSIONS = ("real", "sim")  # the first big run's arms
+ARMS = ("real", "sim", "sensei", "chain", "blind", "fixed")  # in the order the tables show
+ARM_TITLES = {
+    "real": "Clarity real",
+    "sim": "Clarity sim",
+    "sensei": "Clarity no pixel size",
+    "chain": "Clarity + MTF, SNR",
+    "blind": "Clarity told nothing",
+    "fixed": "U-Net fixed bands",
+}
 TESTS = ("A", "B", "C", "D", "E", "F")
 NO_LABEL = 255
 NAMES = ("clear", "thin", "thick", "shadow")
@@ -104,19 +122,21 @@ def same(x: np.ndarray) -> np.ndarray:
 @dataclass
 class Item:
     """One scene to score: its image (bands, H, W) in any units, to_rho turning tiles of it
-    (n, bands, h, w) into reflectance, its card (bands, 6), its label in Catena's codes, other
-    predictions of it (OmniCloudMask's drafts, in Catena's codes, by name), whether its
-    shadows were labelled, and the tiles to predict it in."""
+    (n, bands, h, w) into reflectance, its chain cards (bands, 11), its label in Catena's codes,
+    other predictions of it (OmniCloudMask's drafts, in Catena's codes, by name), whether its
+    shadows were labelled, the tiles to predict it in, and where blue, green, red and near
+    infrared sit among its bands (rgbn: for the fixed arm; None, no fixed-band prediction)."""
 
     name: str
     image: np.ndarray
-    card: np.ndarray
+    told: np.ndarray
     label: np.ndarray
     to_rho: Callable[[np.ndarray], np.ndarray] = same
     others: dict = field(default_factory=dict)
     shadow_ok: bool = True
     tile: int = TILE
     margin: int = MARGIN
+    rgbn: tuple | None = None
 
 
 @dataclass
@@ -156,7 +176,7 @@ def owned(first: list[int], tile: int, n: int) -> list[tuple[int, int]]:
 
 
 def predict(classify, item: Item) -> dict[str, np.ndarray]:
-    """Every model's classes (H, W) uint8 over the scene: classify(x, card), x the
+    """Every model's classes (H, W) uint8 over the scene: classify(x, told, rgbn), x the
     reflectance of a batch of tiles (n, bands, tile, tile), gives {model: classes (n, tile,
     tile)}. Tiles that own no labelled pixel are not predicted (255 there)."""
     image, size = item.image, item.tile
@@ -178,7 +198,7 @@ def predict(classify, item: Item) -> dict[str, np.ndarray]:
     for k in range(0, len(jobs), per_batch):
         part = jobs[k : k + per_batch]
         x = np.stack([image[:, r : r + size, c : c + size] for r, c, _, _ in part])
-        found = classify(np.ascontiguousarray(item.to_rho(x), np.float32), item.card)
+        found = classify(np.ascontiguousarray(item.to_rho(x), np.float32), item.told, item.rgbn)
         for model, classes in found.items():
             pred = out.setdefault(model, np.full((height, width), NO_LABEL, np.uint8))
             for (r, c, (r0, r1), (c0, c1)), p in zip(part, classes, strict=True):
@@ -293,6 +313,7 @@ def landsat_set(test: str, module, root: Path, title: str, ocm=None) -> SceneSet
     chosen = module.scenes(root, "pilot")
     landsat8 = module is biome
     rgb, rgn = ((3, 2, 1), (3, 2, 4)) if landsat8 else ((2, 1, 0), (2, 1, 3))
+    four = (1, 2, 3, 4) if landsat8 else (0, 1, 2, 3)  # blue, green, red, near infrared
 
     def items() -> Iterator[Item]:
         for scene in chosen:
@@ -305,13 +326,14 @@ def landsat_set(test: str, module, root: Path, title: str, ocm=None) -> SceneSet
             yield Item(
                 scene.name,
                 dn,
-                desc.card(module.descriptors(scene)),
+                desc.chain_card(module.descriptors(scene)),
                 label,
                 lambda x, scene=scene: module.reflectance(scene, x),
                 others,
                 shadow_ok=scene.has_shadow,
                 tile=LANDSAT_TILE,
                 margin=LANDSAT_MARGIN,
+                rgbn=four,
             )
 
     name = "landsat8" if landsat8 else "landsat7"
@@ -323,12 +345,13 @@ def heo_set(data: Path, role: str, title: str) -> SceneSet:
     chosen = heo.scenes(data, (role,))
 
     def items() -> Iterator[Item]:
-        card = desc.card(heo.descriptors())
+        told = desc.chain_card(heo.descriptors())
         for scene in chosen:
             dn, label = heo.read(scene)
             drafts = found_drafts(scene.label.parent, ("ocm4",))
             label = with_drafts(np.where(dn.all(axis=0), label, NO_LABEL), drafts)
-            yield Item(scene.name, dn, card, label, heo.reflectance, drafts, shadow_labelled(label))
+            ok = shadow_labelled(label)
+            yield Item(scene.name, dn, told, label, heo.reflectance, drafts, ok, rgbn=(1, 2, 3, 7))
 
     title = f"{title}, {len(chosen)} scenes"
     return SceneSet("D", f"heo_{role}", title, len(chosen), items, (3, 2, 1), DRAFTED)
@@ -338,12 +361,13 @@ def eaglet2_set(data: Path) -> SceneSet:
     chosen = eaglet2.scenes(data)
 
     def items() -> Iterator[Item]:
-        card = desc.card(eaglet2.descriptors())
+        told = desc.chain_card(eaglet2.descriptors())
         for scene in chosen:
             rho, label = eaglet2.read(scene)
             drafts = found_drafts(scene.label.parent, ("ocm4_nirblue", "ocm4_nirzeros"))
             label = with_drafts(label, drafts)
-            yield Item(scene.name, rho, card, label, same, drafts, shadow_labelled(label))
+            ok = shadow_labelled(label)  # blue stands in for the near infrared it has not
+            yield Item(scene.name, rho, told, label, same, drafts, ok, rgbn=(2, 1, 0, 2))
 
     title = f"IRIDE Eaglet II, never seen, {len(chosen)} scenes"
     return SceneSet("E", "eaglet2", title, len(chosen), items, (0, 1, 2), DRAFTED)
@@ -379,8 +403,9 @@ def phisat2_set(data: Path) -> SceneSet:
                 raise ValueError(f"{r['scene']}: bands {rho.shape} do not fit {label.shape}")
             drafts = found_drafts(labels / r["scene"], ("ocm4",))
             label = with_drafts(np.where((rho > 0).all(axis=0), label, NO_LABEL), drafts)
-            card = desc.card(phisat2_descriptors(info))
-            yield Item(r["scene"], rho, card, label, same, drafts, shadow_labelled(label))
+            told = desc.chain_card(phisat2_descriptors(info))
+            ok = shadow_labelled(label)
+            yield Item(r["scene"], rho, told, label, same, drafts, ok, rgbn=(1, 2, 3, 7))
 
     title = f"Phi-sat-2, never seen, {len(chosen)} scenes"
     return SceneSet("E", "phisat2", title, len(chosen), items, (3, 2, 1), DRAFTED)
@@ -390,10 +415,18 @@ def perusat_set(root: Path) -> SceneSet:
     names = perusat.patches(root, "validation")
 
     def items() -> Iterator[Item]:
-        card = desc.card(perusat.descriptors())
+        told = desc.chain_card(perusat.descriptors())
         for n in names:
             dn, label = perusat.read(root, n)
-            yield Item(f"patch {n}", dn, card, label, perusat.reflectance, shadow_ok=False)
+            yield Item(
+                f"patch {n}",
+                dn,
+                told,
+                label,
+                perusat.reflectance,
+                shadow_ok=False,
+                rgbn=(0, 1, 2, 3),
+            )
 
     title = f"PeruSat-1, CloudPeru2 validation split, {len(names)} patches (cloud or not)"
     return SceneSet("F", "perusat1", title, len(names), items, (2, 1, 0))
@@ -426,45 +459,86 @@ def scene_sets(data: Path, tests, ocm=None) -> list[SceneSet]:
 # --- the networks (torch from here on) -----------------------------------------------------
 
 
-def load_runs(runs: Path, device) -> dict:
-    """Both versions of every finished run under RUNS: {"seed0/real": net, ...}."""
+@dataclass
+class Net:
+    """A trained arm: its network; how many numbers of the chain card it reads (0: the fixed
+    arm, blue, green, red and near infrared instead); whether it is told nothing (zeros)."""
+
+    net: object
+    fields: int
+    blind: bool = False
+
+
+def load_runs(runs, device) -> dict[str, Net]:
+    """Every arm of every finished run under the RUNS folders: {"seed0/real": Net, ...}.
+    A run without a list of its arms is the first big run's: real and sim, on the card."""
     import torch
 
-    from catena.model import Clarity
+    from catena.model import Clarity, FixedBands
 
-    folders = sorted(path.parent for path in Path(runs).glob("*/final.pt"))
-    if not folders:
-        raise SystemExit(f"no finished runs (*/final.pt) in {runs}")
-    nets = {}
-    for folder in folders:
-        state = torch.load(folder / "final.pt", map_location="cpu")
-        if state.get("card") != [desc.FIELDS[k] for k in desc.CARD]:
-            raise SystemExit(f"{folder}: not a run of Clarity on the card ({state.get('card')})")
-        args = state["config"]["args"]
-        for version in VERSIONS:
-            net = Clarity(widths=tuple(args["widths"]), stem=args["stem"], fields=desc.N_CARD)
-            net.load_state_dict(state["models"][version])
-            nets[f"{folder.name}/{version}"] = net.to(device).eval()
+    roots = [Path(r) for r in ([runs] if isinstance(runs, str | Path) else runs)]
+    nets: dict[str, Net] = {}
+    where: dict[str, Path] = {}
+    for root in roots:
+        folders = sorted(path.parent for path in root.glob("**/final.pt"))
+        if not folders:
+            raise SystemExit(f"no finished runs (final.pt) in {root}")
+        for folder in folders:
+            state = torch.load(folder / "final.pt", map_location="cpu")
+            card = state.get("card")
+            if card != [desc.FIELDS[k] for k in desc.CARD]:
+                raise SystemExit(f"{folder}: not a run of Clarity on the card ({card})")
+            args = state["config"]["args"]
+            first = {v: {"fields": desc.N_CARD, "blind": False} for v in VERSIONS}
+            for arm, design in (state.get("arms") or first).items():
+                name = f"{folder.name}/{arm}"
+                if name in nets:
+                    raise SystemExit(f"{name} in {where[name]} and {folder}: evaluate them apart")
+                fields, widths = int(design["fields"]), tuple(args["widths"])
+                if fields == 0:
+                    net = FixedBands(widths=widths, stem=args["stem"])
+                else:
+                    net = Clarity(widths=widths, stem=args["stem"], fields=fields)
+                net.load_state_dict(state["models"][arm])
+                blind = bool(design.get("blind", False))
+                nets[name] = Net(net.to(device).eval(), fields, blind)
+                where[name] = folder
     return nets
 
 
-def classifier(nets: dict, device, amp: bool):
-    """classify(x, card) for predict(): every network on a batch of tiles."""
+def run_nets(nets: dict[str, Net], image, told, real, four, amp: bool) -> dict:
+    """Every network's logits on a batch (torch): image (n, bands, h, w), told (n, bands, 11)
+    and real (n, bands) on its device; four, where blue, green, red and near infrared sit
+    among the bands, or None (then the fixed arm says nothing)."""
+    import torch
+
+    zeros = torch.zeros_like(told)
+    out = {}
+    for model, entry in nets.items():
+        if entry.fields == 0:
+            if four is None:
+                continue
+            inputs = (image[:, list(four)], None, None)
+        else:
+            inputs = (image, zeros if entry.blind else told, real)
+        with torch.autocast(device_type=image.device.type, dtype=torch.bfloat16, enabled=amp):
+            out[model] = entry.net(*inputs)
+    return out
+
+
+def classifier(nets: dict[str, Net], device, amp: bool):
+    """classify(x, told, rgbn) for predict(): every network on a batch of tiles."""
     import torch
 
     @torch.no_grad()
-    def classify(x: np.ndarray, card: np.ndarray) -> dict[str, np.ndarray]:
+    def classify(x: np.ndarray, told: np.ndarray, rgbn=None) -> dict[str, np.ndarray]:
         n, bands = x.shape[:2]
         image = torch.from_numpy(x).to(device)
-        told = torch.from_numpy(np.ascontiguousarray(card, np.float32)).to(device)
-        told = told.expand(n, -1, -1)
+        cards = torch.from_numpy(np.ascontiguousarray(told, np.float32)).to(device)
+        cards = cards.expand(n, -1, -1)
         real = torch.ones(n, bands, dtype=torch.bool, device=device)
-        out = {}
-        for model, net in nets.items():
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
-                logits = net(image, told, real)
-            out[model] = logits.argmax(dim=1).to(torch.uint8).cpu().numpy()
-        return out
+        logits = run_nets(nets, image, cards, real, rgbn, amp)
+        return {m: v.argmax(dim=1).to(torch.uint8).cpu().numpy() for m, v in logits.items()}
 
     return classify
 
@@ -479,6 +553,7 @@ def cameras(
     from catena import train as T
     from catena.data import loader
     from catena.evaluate import TEST_CAMERAS, CameraWindows
+    from catena.train_clarity import rgbn_slots
 
     windows = loader.GridWindows(chips, "test", size=size)
     found = {}
@@ -493,16 +568,15 @@ def cameras(
             worker_init_fn=T.quiet,
         )
         conf = {model: torch.zeros(4, 4, dtype=torch.long, device=device) for model in nets}
+        four = rgbn_slots(camera[2])
         with torch.no_grad():
             for b in batches:
                 x = b["image"].to(device, non_blocking=True)
                 real = b["real"].to(device, non_blocking=True)
-                card = desc.card(b["d_told"]).to(device, non_blocking=True)
+                told = desc.chain_card(b["d_told"]).to(device, non_blocking=True)
                 y = b["label"].to(device, non_blocking=True)
                 ok = y < 4
-                for model, net in nets.items():
-                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
-                        logits = net(x, card, real)
+                for model, logits in run_nets(nets, x, told, real, four, amp).items():
                     pairs = y[ok] * 4 + logits.argmax(dim=1)[ok]
                     conf[model] += torch.bincount(pairs, minlength=16).view(4, 4)
         found[camera[0]] = {}
@@ -519,9 +593,10 @@ def cameras(
 
 
 def group_of(model: str) -> str:
-    """seed0/real -> Clarity real; ocm4 -> OmniCloudMask."""
+    """seed0/real -> Clarity real; seed1/fixed -> U-Net fixed bands; ocm4 -> OmniCloudMask."""
     if "/" in model:
-        return f"Clarity {model.split('/', 1)[1]}"
+        arm = model.rsplit("/", 1)[1]
+        return ARM_TITLES.get(arm, f"Clarity {arm}")
     return OCM.get(model, model)
 
 
@@ -540,11 +615,12 @@ def table(per_model: dict[str, dict]) -> list[str]:
     groups: dict[str, list[dict]] = {}
     for model, s in per_model.items():
         groups.setdefault(group_of(model), []).append(s)
-    lines = [f"  {'':<30}" + "".join(f"{h:>14}" for h in HEADS)]
+    lines = [f"  {'':<34}" + "".join(f"{h:>14}" for h in HEADS)]
     for name, members in groups.items():
         cells = [cell([m[k] for m in members]) for k in SHOWN]
-        seeds = f" ({len(members)} seeds)" if name.startswith("Clarity") else ""
-        lines.append(f"  {name + seeds:<30}" + "".join(f"{c:>14}" for c in cells))
+        n = len(members)
+        seeds = f" ({n} seed{'s' * (n != 1)})" if name not in OCM.values() else ""
+        lines.append(f"  {name + seeds:<34}" + "".join(f"{c:>14}" for c in cells))
     return lines
 
 
@@ -667,7 +743,7 @@ def camera_lines(found: dict, size: int = TILE) -> tuple[list[dict], list[str]]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("runs", type=Path, help="one folder per seed with final.pt (runs/big)")
+    p.add_argument("runs", type=Path, nargs="+", help="folders of finished runs (runs/big)")
     p.add_argument("--data", type=Path, default=Path("/root/catena_data"))
     p.add_argument("--tests", nargs="+", default=list(TESTS), choices=list(TESTS))
     p.add_argument("--windows", type=int, default=800, help="Test A: windows per camera")
@@ -684,11 +760,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def default_out(runs: Path, tests, ocm: bool) -> Path:
-    """clarity_tests.csv for the six tests, clarity_tests_<tests>[_ocm].csv otherwise."""
+def default_out(runs, tests, ocm: bool) -> Path:
+    """In the (last) RUNS folder: clarity_tests.csv for the six tests,
+    clarity_tests_<tests>[_ocm].csv otherwise."""
+    folder = Path(runs if isinstance(runs, str | Path) else runs[-1])
     if set(tests) == set(TESTS) and not ocm:
-        return Path(runs) / "clarity_tests.csv"
-    return Path(runs) / f"clarity_tests_{''.join(sorted(tests))}{'_ocm' if ocm else ''}.csv"
+        return folder / "clarity_tests.csv"
+    return folder / f"clarity_tests_{''.join(sorted(tests))}{'_ocm' if ocm else ''}.csv"
 
 
 def main(argv: list[str] | None = None) -> None:

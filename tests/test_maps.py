@@ -1,4 +1,4 @@
-"""The kept maps: a version's map is the vote of its seeds; each scene's numbers and its
+"""The kept maps: an arm's map is the vote of its seeds; each scene's numbers and its
 picture, from made-up .npz files laid out as catena.evaluate_clarity --maps writes them."""
 
 from __future__ import annotations
@@ -61,3 +61,12 @@ def test_numbers_and_picture(tmp_path):
     assert fig.axes[3].get_title().startswith("Clarity sim: cloud 100%")
     assert maps.Kept(tmp_path / "none", "eaglet2").scenes == []
     assert maps.Kept(tmp_path / "none", "eaglet2").columns() == maps.COLUMNS
+
+
+def test_every_arm_has_its_title(tmp_path):
+    kept_scene(tmp_path)
+    kept = maps.Kept(tmp_path, "eaglet2")
+    arrays = kept.load(kept.scenes[0])
+    arrays |= {"seed0_fixed": arrays["seed0_sim"], "seed0_chain": arrays["seed0_real"]}
+    names = list(kept.models(arrays))
+    assert names[:4] == ["Clarity real", "Clarity sim", "Clarity + MTF, SNR", "U-Net fixed bands"]

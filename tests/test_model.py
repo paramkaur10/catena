@@ -1,6 +1,6 @@
 """The network: output shape and size, indifference to band order and to padding, older
 networks reading the fields they know, folding FiLM into the GroupNorm without changing the
-output, and gradients reaching every part."""
+output, gradients reaching every part, and the baseline on fixed bands."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from catena.descriptor import N_CARD, N_FIELDS  # noqa: E402
-from catena.model import Clarity, FiLM, count_parameters, fold_block  # noqa: E402
+from catena.model import Clarity, FiLM, FixedBands, count_parameters, fold_block  # noqa: E402
 
 
 def small(train: bool = False):
@@ -87,4 +87,19 @@ def test_gradients_reach_every_part():
     x, d, real = inputs()
     net(x, d, real).square().mean().backward()
     for name, p in net.named_parameters():
+        assert p.grad is not None, name
+
+
+def test_the_baseline_on_fixed_bands():
+    net = FixedBands().eval()
+    assert count_parameters(net) == 1_967_172  # about Clarity folded for one sensor
+    x = torch.rand(2, 4, 48, 48)
+    with torch.no_grad():
+        out = net(x)
+        assert out.shape == (2, 4, 48, 48)
+        d, real = inputs(bands=4, size=48)[1:]
+        assert torch.equal(net(x, d, real), out)  # told nothing: it ignores the cards
+    small_net = FixedBands(widths=(8, 8, 8, 8), stem=8).train()
+    small_net(torch.rand(2, 4, 24, 24)).square().mean().backward()
+    for name, p in small_net.named_parameters():
         assert p.grad is not None, name

@@ -19,6 +19,12 @@ sensor every FiLM is a constant that fold_block() bakes into the GroupNorm befor
 2,185,141 parameters with the default sizes, 4.4 MB at float16; reading the 6 numbers of the
 card (fields=6, catena.descriptor.card), as in the big run, 2,184,565. The budget is 6 MB at
 float16, the copy that flies: 3 M parameters.
+
+FixedBands, the baseline without a band encoder: the same U-Net, without FiLM, on four bands
+in a fixed order (blue, green, red, near infrared), as a network made for one band set is.
+Its stem (two 3x3 convolutions) gives the U-Net the 32 channels the band encoder gives
+Clarity. 1,967,172 parameters with the default sizes: about what Clarity folded for one
+sensor flies with, since folding drops the FiLM makers and the descriptor code.
 """
 
 from __future__ import annotations
@@ -119,6 +125,55 @@ class Clarity(nn.Module):
         for first, second in self.up:
             f = F.interpolate(f, scale_factor=2, mode="bilinear", align_corners=False)
             f = second(first(torch.cat([f, skips.pop()], dim=1), z), z)
+        return self.head(f)  # (B, 4, H, W) logits; H and W must be multiples of 8
+
+
+class ConvBlock(nn.Module):
+    """3x3 conv -> GroupNorm -> GELU: ConvFiLM without FiLM, one block of FixedBands."""
+
+    def __init__(self, cin: int, cout: int):
+        super().__init__()
+        self.conv = nn.Conv2d(cin, cout, 3, padding=1, bias=False)
+        self.norm = nn.GroupNorm(8, cout)
+
+    def forward(self, x):
+        return F.gelu(self.norm(self.conv(x)))
+
+
+class FixedBands(nn.Module):
+    """Clarity's U-Net without the band encoder and FiLM, on `bands` bands in a fixed order
+    (blue, green, red, near infrared). forward(x, d=None, real=None) takes x (B, bands, H, W)
+    and ignores d and real, so it is called as Clarity is."""
+
+    def __init__(self, widths=(32, 64, 128, 256), classes: int = 4, stem: int = 16, bands: int = 4):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(bands, 2 * stem, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(2 * stem, 2 * stem, 3, padding=1),
+            nn.GELU(),
+        )
+        ins = [2 * stem, *widths[:-1]]
+        self.down = nn.ModuleList(
+            nn.ModuleList([ConvBlock(i, o), ConvBlock(o, o)])
+            for i, o in zip(ins, widths, strict=True)
+        )
+        self.up = nn.ModuleList(
+            nn.ModuleList([ConvBlock(deep + o, o), ConvBlock(o, o)])
+            for deep, o in zip(widths[:0:-1], widths[-2::-1], strict=True)
+        )
+        self.head = nn.Conv2d(widths[0], classes, 1)
+
+    def forward(self, x, d=None, real=None):
+        f = self.stem(x)
+        skips = []
+        for i, (first, second) in enumerate(self.down):
+            f = second(first(F.max_pool2d(f, 2) if i else f))
+            skips.append(f)
+        skips.pop()  # the deepest map is f itself
+        for first, second in self.up:
+            f = F.interpolate(f, scale_factor=2, mode="bilinear", align_corners=False)
+            f = second(first(torch.cat([f, skips.pop()], dim=1)))
         return self.head(f)  # (B, 4, H, W) logits; H and W must be multiples of 8
 
 

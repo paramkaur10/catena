@@ -1,5 +1,6 @@
 """The card's newest parts: the pixel size on the ground, told to both arms, roughly right
-cards (jitter), and the six numbers Clarity reads."""
+cards (jitter), the six numbers Clarity reads, and the chain card: the card, then the MTF
+and the SNR."""
 
 from __future__ import annotations
 
@@ -60,3 +61,20 @@ def test_what_clarity_reads():
     assert c[5] == d[desc.GSD] == 0.0  # 10 m grid
     stacked = desc.card(np.stack([d, d, d]))
     assert stacked.shape == (3, 6) and (stacked[1] == c).all()
+
+
+def test_the_chain_card():
+    known = desc.describe(*RED, 20, 10, 0.25, AB, 1e-3, 1.2)
+    unknown = desc.describe(*RED, 30, 30)  # no MTF, no SNR
+    told = desc.chain_card(np.stack([known, unknown]))
+    assert told.shape == (2, desc.N_CHAIN_CARD) == (2, 11)
+    assert np.array_equal(told[:, : desc.N_CARD], desc.card(np.stack([known, unknown])))
+    assert told[0, 6] == known[5] > 0  # the blur, from the MTF
+    assert told[0, 7:9].tolist() == known[6:8].tolist()  # the noise at 0.05 and 0.5, from the SNR
+    assert told[0, 9:].tolist() == [1.0, 1.0]  # both known
+    assert (told[1, 6:] == 0).all()  # unknown: 0, flags 0
+    assert told[0, 5] == known[desc.GSD]  # the grid's pixel size stays where the card has it
+    rng = np.random.default_rng(0)
+    for _ in range(50):  # dropout and errors never touch the card's six numbers
+        moved = desc.chain_card(desc.jitter(desc.hide(np.stack([known] * 3), rng), rng))
+        assert np.array_equal(moved[:, : desc.N_CARD], np.stack([told[0, : desc.N_CARD]] * 3))

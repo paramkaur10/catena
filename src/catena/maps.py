@@ -1,7 +1,8 @@
 """What the networks predicted, scene by scene, beside the true colour and the label: the files
 catena.evaluate_clarity --maps keeps, one per scene (<set>__<scene>.npz) with the label,
-every network's classes (seed0_real ... seed2_sim), OmniCloudMask's where it ran (ocm4,
-ocm4_nirblue, ocm4_nirzeros), the true colour (rgb, every step-th pixel) and step.
+every network's classes (seed0_real ... seed2_sim, and seed0_chain ... for the arms that test
+the method), OmniCloudMask's where it ran (ocm4, ocm4_nirblue, ocm4_nirzeros), the true
+colour (rgb, every step-th pixel) and step.
 
     from catena import maps
     kept = maps.Kept(Path("/root/catena_data/runs/big/maps"), "eaglet2")
@@ -9,7 +10,7 @@ ocm4_nirblue, ocm4_nirzeros), the true colour (rgb, every step-th pixel) and ste
     for scene in kept.scenes:
         kept.show(scene)  # true colour | label | OmniCloudMask | Clarity real | Clarity sim
 
-A version's map is the class most of its seeds chose at each pixel; when the seeds all differ,
+An arm's map is the class most of its seeds chose at each pixel; when the seeds all differ,
 the lowest code wins (clear, then thin, thick, shadow). Cloud is thin or thick (label codes
 1, 2 and, for CloudPeru2, 4); balanced accuracy is that of cloud against not cloud over the
 labelled pixels, as in the tests (catena.evaluate_clarity.scores).
@@ -59,12 +60,13 @@ class Kept:
             return {k: z[k] for k in z.files}
 
     def models(self, arrays: dict) -> dict[str, np.ndarray]:
-        """Clarity real and sim (each the vote of its seeds), then OmniCloudMask's maps."""
+        """Every arm kept (Clarity real, sim, ..., each the vote of its seeds), then
+        OmniCloudMask's maps."""
         out = {}
-        for version in E.VERSIONS:
-            seeds = [arrays[k] for k in sorted(arrays) if k.endswith(f"_{version}")]
+        for arm in E.ARMS:
+            seeds = [arrays[k] for k in sorted(arrays) if k.endswith(f"_{arm}")]
             if seeds:
-                out[f"Clarity {version}"] = vote(seeds)
+                out[E.ARM_TITLES[arm]] = vote(seeds)
         out |= {name_of(k): arrays[k] for k in E.OCM if k in arrays}
         return out
 

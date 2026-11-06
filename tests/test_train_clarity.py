@@ -1,6 +1,6 @@
 """The big run: samples from the four satellites for both versions, the real version
-untouched by the made-up cameras, and short runs on made-up data (CPU, a tiny network),
-stopped and gone on with, which end where an unbroken run ends."""
+untouched by the made-up cameras, what the arms add drawn apart, and short runs on made-up
+data (CPU, a tiny network), stopped and gone on with, which end where an unbroken run ends."""
 
 from __future__ import annotations
 
@@ -171,8 +171,9 @@ def test_samples_of_every_satellite(data):
         i = sources.index(source)
         x = s[i]
         n = int(x["real"].sum())
-        assert x["card"].shape == (13, 6) and x["label"].dtype == np.int64
-        assert (x["image"][n:] == 0).all() and (x["card"][n:] == 0).all()
+        assert x["told"].shape == (13, 11) and x["label"].dtype == np.int64
+        assert x["sim_told"].shape == (13, 11) and "fixed_image" not in x
+        assert (x["image"][n:] == 0).all() and (x["told"][n:] == 0).all()
         assert not x["real"][n:].any() and C.SOURCES[x["source"]] == source
         labels = set(np.unique(x["label"]).tolist())
         if source == "sentinel2":
@@ -180,26 +181,26 @@ def test_samples_of_every_satellite(data):
             assert 3 <= n <= 13 and x["image"].shape == (13, WINDOW, WINDOW) and not x["same"]
             assert x["sim_image"].shape == (13, WINDOW // q, WINDOW // q)
             assert x["sim_label"].shape == (WINDOW // q, WINDOW // q)
-            assert (x["card"][:n, 5] == 0).all()  # 10 m
-            assert x["sim_card"][:n, 5] == pytest.approx(math.log2(q))
+            assert (x["told"][:n, 5] == 0).all()  # 10 m
+            assert x["sim_told"][:n, 5] == pytest.approx(math.log2(q))
             assert labels <= {0, 1, 2, 3, 255}
             continue
         assert x["same"] and x["image"].shape == (13, SMALL, SMALL)
         if source == "landsat8":
-            assert 3 <= n <= 8 and x["card"][:n, 5] == pytest.approx(math.log2(3))
+            assert 3 <= n <= 8 and x["told"][:n, 5] == pytest.approx(math.log2(3))
             assert labels <= {1, 2, 5, 255}  # no shadow labels: clear is 5
         elif source == "heo":
-            assert 3 <= n <= 8 and x["card"][:n, 5] == pytest.approx(-1.0)
-            assert (x["card"][:n, 3] == 0).all() and labels <= {0, 1, 2, 3, 255}
+            assert 3 <= n <= 8 and x["told"][:n, 5] == pytest.approx(-1.0)
+            assert (x["told"][:n, 3] == 0).all() and labels <= {0, 1, 2, 3, 255}
         else:
-            assert n in (3, 4) and (x["card"][:n, 3] == 1).all()  # surface reflectance
-            assert x["card"][:n, 5] == pytest.approx(math.log2(0.28))
+            assert n in (3, 4) and (x["told"][:n, 3] == 1).all()  # surface reflectance
+            assert x["told"][:n, 5] == pytest.approx(math.log2(0.28))
             assert labels <= {4, 5, 255}
             top = 1.5 * 1.05 * 250 / 255
             assert (x["image"][:n] > 0).all() and (x["image"][:n] <= top + 1e-6).all()
     again = s[sources.index("sentinel2")]
     first = s[sources.index("sentinel2")]
-    for key in ("image", "sim_image", "card", "sim_card", "label", "sim_label"):
+    for key in ("image", "sim_image", "told", "sim_told", "label", "sim_label"):
         assert np.array_equal(again[key], first[key])  # sample i is always the same
     with pytest.raises(ValueError, match="landsat8 has a share"):
         C.Samples(s.windows, 4, 0, shares=(0.5, 0.5, 0, 0))
@@ -210,7 +211,7 @@ def test_the_real_version_never_sees_a_camera(data):
     keep_none = samples(data, shares=(1, 0, 0, 0), p_s2=0.0)  # sim: a camera for every one
     for i in range(0, 240, 4):
         a, b = keep_all[i], keep_none[i]
-        for key in ("image", "card", "label", "real"):
+        for key in ("image", "told", "label", "real"):
             assert np.array_equal(a[key], b[key])  # the real version: the same either way
         if keep_all.pixel_size(i) == 1:
             assert np.array_equal(a["sim_image"], a["image"])  # kept as delivered
@@ -222,12 +223,12 @@ def test_the_sim_options_leave_the_real_version_alone(data):
     other = samples(data, shares=QUARTERS, q_weights=(1, 0, 0), faults=1.0)
     for i in range(0, 240, 4):
         a, b = plain[i], other[i]
-        for key in ("image", "card", "label", "real"):
+        for key in ("image", "told", "label", "real"):
             assert np.array_equal(a[key], b[key])  # the real version: the same either way
         assert other.pixel_size(i) == 1 and not b["same"]  # 10 m; its own copy everywhere
         assert b["sim_image"].shape == b["image"].shape
         assert np.array_equal(b["sim_label"], b["label"])
-        assert np.array_equal(b["sim_card"], b["card"])  # a fault is not on the card
+        assert np.array_equal(b["sim_told"][:, :6], b["told"][:, :6])  # a fault is not on the card
         n = int(b["real"].sum())
         assert not np.array_equal(b["sim_image"][:n], b["image"][:n])  # every sample faulty
         assert (b["sim_image"][n:] == 0).all()
@@ -250,6 +251,54 @@ def test_going_on_draws_the_same_samples(data):
     for j in (0, 5):
         for key, value in later[j].items():
             assert np.array_equal(value, whole[8 + j][key])
+
+
+def test_what_the_arms_add_is_drawn_apart(data):
+    plain = samples(data, shares=QUARTERS, chain_jitter=0.0)
+    arms = samples(data, shares=QUARTERS, fixed=True, chain_jitter=0.0)
+    hidden = kept = 0
+    for i in range(240):
+        a, b = plain[i], arms[i]
+        for key in ("image", "told", "label", "real", "sim_image", "sim_label", "same"):
+            assert np.array_equal(a[key], b[key])  # the fixed arm's bands: drawn apart
+        assert np.array_equal(a["sim_told"], b["sim_told"])  # dropout and errors: drawn apart
+        n = int(b["real"].sum())
+        assert np.array_equal(b["sim_told"][:, :6], b["told"][:, :6]) or not b["same"]
+        x, same = b["fixed_image"], bool(b["same"])
+        label = b["label"] if same else b["sim_label"]
+        assert x.shape == (4, *label.shape) and x.dtype == np.float32 and np.isfinite(x).all()
+        source = C.SOURCES[b["source"]]
+        if source != "sentinel2":  # its bands as delivered, turned as the others are
+            assert (x > 0).all()
+        if source == "landsat8":  # Landsat 8's noise is known: dropout hides it now and then
+            told, sim_told = b["told"][:n], b["sim_told"][:n]
+            assert (told[:, 10] == 1).all() and (told[:, 9] == 0).all()  # SNR yes, MTF no
+            hidden += int((sim_told[:, 10] == 0).all())
+            kept += int((sim_told[:, 7:9] == told[:, 7:9]).all() and (sim_told[:, 10] == 1).all())
+    assert hidden > 0 and kept > 0  # hidden in some samples, as it was in the others (no errors)
+    moved = samples(data, shares=QUARTERS, chain_jitter=1.0)
+    changed = 0
+    for i in range(240):
+        a, b = arms[i], moved[i]
+        assert np.array_equal(a["sim_told"][:, :6], b["sim_told"][:, :6])  # never the card
+        changed += int(not np.array_equal(a["sim_told"], b["sim_told"]))
+    assert changed > 0  # errors move the known MTF and SNR
+    with pytest.raises(ValueError, match="no faults"):
+        samples(data, fixed=True, faults=0.5)
+
+
+def test_the_arms():
+    assert set(C.ARMS) == {"real", "sim", "sensei", "chain", "blind", "fixed"}
+    assert C.ARMS["sensei"].fields == 4 and C.ARMS["chain"].fields == 11  # their first numbers
+    assert C.ARMS["fixed"].fields == 0 and C.ARMS["blind"].blind
+    assert all(a.data == "sim" for k, a in C.ARMS.items() if k != "real")
+    assert C.rgbn_slots(loader.BANDS) == [1, 2, 3, 7]
+    assert C.rgbn_slots(("B01", "B02", "B03", "B04", "B8A", "B10", "B11", "B12")) == [1, 2, 3, 4]
+    for bad in (["--arms", "sim", "sim"], ["--arms", "fixed", "sim", "--faults", "0.2"]):
+        with pytest.raises(SystemExit):
+            C.parse_args(["x", *bad])
+    with pytest.raises(SystemExit):
+        C.parse_args(["x", "--arms", "chain", "other"])
 
 
 def run_args(data, out, *more) -> list[str]:
@@ -307,6 +356,25 @@ def test_a_short_run_with_the_sim_options(data, tmp_path):
     for bad in (["--q-weights", "1", "-1", "0"], ["--faults", "1.5"], ["--fault-nir", "1"]):
         with pytest.raises(SystemExit):
             C.parse_args([str(tmp_path / "x"), *bad])
+
+
+def test_short_runs_of_the_arms(data, tmp_path):
+    C.main(run_args(data, tmp_path / "chain", "--arms", "chain", "fixed"))
+    state = torch.load(tmp_path / "chain/final.pt", map_location="cpu")
+    assert set(state["models"]) == {"chain", "fixed"} and state["step"] == 4
+    assert state["arms"]["chain"] == {"data": "sim", "fields": 11, "blind": False}
+    assert state["arms"]["fixed"]["fields"] == 0
+    assert state["models"]["chain"]["bands.embed.0.weight"].shape[1] == 11
+    assert not any(k.startswith("bands.") for k in state["models"]["fixed"])
+    config = json.loads((tmp_path / "chain/config.json").read_text())
+    assert set(config["parameters"]) == {"chain", "fixed"} and config["chain_card"][6] == "psf"
+    entries = [json.loads(x) for x in (tmp_path / "chain/metrics.jsonl").read_text().splitlines()]
+    assert {e["version"] for e in entries if e["kind"] == "val"} == {"chain", "fixed"}
+    C.main(run_args(data, tmp_path / "sensei", "--arms", "sensei", "blind"))
+    state = torch.load(tmp_path / "sensei/final.pt", map_location="cpu")
+    assert state["models"]["sensei"]["bands.embed.0.weight"].shape[1] == 4
+    assert state["models"]["blind"]["bands.embed.0.weight"].shape[1] == 6
+    assert state["arms"]["blind"]["blind"]
 
 
 def test_the_versions_part_on_sentinel2(data, tmp_path):

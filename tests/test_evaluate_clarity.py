@@ -274,8 +274,9 @@ def fake(margin: int):
     """A classifier whose answer shows where in a tile a pixel lay: clear, thin or thick by
     its first band, but shadow within margin of the tile's edge."""
 
-    def classify(x: np.ndarray, card: np.ndarray) -> dict:
-        assert x.dtype == np.float32 and card.shape == (x.shape[1], desc.N_CARD)
+    def classify(x: np.ndarray, told: np.ndarray, rgbn=None) -> dict:
+        assert x.dtype == np.float32 and told.shape == (x.shape[1], desc.N_CHAIN_CARD)
+        assert rgbn is None or (len(rgbn) == 4 and max(rgbn) < x.shape[1])
         out = np.clip(np.floor(x[:, 0] * 3), 0, 2).astype(np.uint8)
         edge = np.ones(x.shape[-2:], bool)
         edge[margin:-margin, margin:-margin] = False
@@ -290,15 +291,15 @@ def test_each_pixel_comes_from_the_tile_it_lies_deepest_in():
     image = rng.random((2, 300, 520)).astype(np.float32)
     label = np.zeros((300, 520), np.uint8)
     label[:, 400:] = 255  # no label on the right: those tiles are not predicted
-    card = np.zeros((2, desc.N_CARD), np.float32)
-    item = E.Item("x", image, card, label, tile=80, margin=10)
+    told = np.zeros((2, desc.N_CHAIN_CARD), np.float32)
+    item = E.Item("x", image, told, label, tile=80, margin=10)
     pred = E.predict(fake(10), item)["m"]
     expect = np.clip(np.floor(image[0] * 3), 0, 2)
     inner = (slice(10, -10), slice(10, 400))  # away from the scene's edges
     assert (pred[inner] == expect[inner]).all()  # never within 10 px of a tile's edge
     assert (pred[:, :400][label[:, :400] != 255] < 255).all()
     assert (pred[:, 480:] == 255).all()  # tiles over no label at all: left out
-    small = E.Item("s", image[:, :50, :60], card, label[:50, :60])  # smaller than a tile
+    small = E.Item("s", image[:, :50, :60], told, label[:50, :60])  # smaller than a tile
     out = E.predict(fake(30), small)["m2"]
     assert out.shape == (50, 60) and (out[30:, 30:] == expect[30:50, 30:60]).all()
 
@@ -341,25 +342,36 @@ def test_the_sets(data, capsys):
     items = {name: list(s.items()) for name, s in sets.items()}
     l8 = items["landsat8"]
     assert [i.shadow_ok for i in l8] == [True, False] and (l8[0].tile, l8[0].margin) == (80, 10)
-    assert l8[0].card.shape == (8, desc.N_CARD) and (l8[0].label[:, :8] == 255).all()
+    assert l8[0].told.shape == (8, desc.N_CHAIN_CARD) and (l8[0].label[:, :8] == 255).all()
+    assert (l8[0].told[:, 10] == 1).all() and (l8[0].told[:, 9] == 0).all()  # SNR, no MTF
     rho = l8[0].to_rho(l8[0].image[None, :, :8, 8:16])
     assert rho.shape == (1, 8, 8, 8) and rho.dtype == np.float32 and (rho > 0).all()
-    assert items["landsat7"][0].card.shape == (6, desc.N_CARD)
+    assert items["landsat7"][0].told.shape == (6, desc.N_CHAIN_CARD)
+    rgbn = {name: found[0].rgbn for name, found in items.items()}
+    assert rgbn == {
+        "landsat8": (1, 2, 3, 4),
+        "landsat7": (0, 1, 2, 3),
+        "heo_test": (1, 2, 3, 7),
+        "heo_stress": (1, 2, 3, 7),
+        "eaglet2": (2, 1, 0, 2),  # no near infrared: blue stands in
+        "phisat2": (1, 2, 3, 7),
+        "perusat1": (0, 1, 2, 3),
+    }
     test = items["heo_test"]
     assert [i.name for i in test] == ["IMH12_20260930T092923", "IMH14_20261008T090717"]
     assert [i.shadow_ok for i in test] == [True, False]  # the second: cloud, no shadow label
     first = test[0]
     assert set(first.others) == {"ocm4"} and (first.label[:2] == 255).all()  # no red there
     assert (first.label[:, -1] == 255).all()  # the draft has no data there
-    assert first.card[:, 5] == pytest.approx(-1.0) and first.to_rho is heo.reflectance
+    assert first.told[:, 5] == pytest.approx(-1.0) and first.to_rho is heo.reflectance
     ocm = first.others["ocm4"]
     assert ocm[5, 5] in (0, 2) and ocm[-2, 0] in (0, 3)  # in Catena's codes
     eag = items["eaglet2"][0]
     assert set(eag.others) == {"ocm4_nirblue", "ocm4_nirzeros"} and eag.image.shape == (3, 50, 60)
     assert (eag.label[:2] == 255).all()  # where one of the drafts has no data
     phi = items["phisat2"][0]
-    assert phi.image.shape == (8, 64, 64) and phi.card.shape == (8, desc.N_CARD)
-    assert (phi.label[:4, :4] == 255).all() and -2.2 < phi.card[0, 5] < -0.5  # about 4 m
+    assert phi.image.shape == (8, 64, 64) and phi.told.shape == (8, desc.N_CHAIN_CARD)
+    assert (phi.label[:4, :4] == 255).all() and -2.2 < phi.told[0, 5] < -0.5  # about 4 m
     peru = items["perusat1"]
     assert [p.name for p in peru] == ["patch 2", "patch 3"] and not peru[0].shadow_ok
     assert set(np.unique(peru[0].label).tolist()) <= {4, 5}
@@ -399,21 +411,33 @@ def test_the_command(data, tmp_path, capsys):
     from catena.model import Clarity
 
     runs = tmp_path / "runs"
+    config = {"args": {"widths": [8, 8, 8, 8], "stem": 8}}
     for seed in (0, 1):
         torch.manual_seed(seed)
         net = Clarity(widths=(8, 8, 8, 8), stem=8, fields=desc.N_CARD)
         (runs / f"seed{seed}").mkdir(parents=True)
-        config = {"args": {"widths": [8, 8, 8, 8], "stem": 8}}
         models = {"real": net, "sim": copy.deepcopy(net)}
         C.save(runs / f"seed{seed}" / "final.pt", 1, models, config)
-    args = [str(runs), "--data", str(data), "--device", "cpu", "--workers", "0"]
+    arms = tmp_path / "arms"  # a run of two arms, one folder deeper
+    (arms / "chain/seed0").mkdir(parents=True)
+    models = {a: C.build(a, (8, 8, 8, 8), 8) for a in ("chain", "fixed")}
+    C.save(arms / "chain/seed0/final.pt", 1, models, config)
+    nets = E.load_runs([arms], "cpu")
+    assert set(nets) == {"seed0/chain", "seed0/fixed"} and nets["seed0/fixed"].fields == 0
+    with pytest.raises(SystemExit, match="evaluate them apart"):
+        E.load_runs([runs, runs], "cpu")
+    args = [str(runs), str(arms), "--data", str(data), "--device", "cpu", "--workers", "0"]
     E.main([*args, "--windows", "2", "--a-size", "48", "--batch", "4"])
+    assert not (runs / "clarity_tests.csv").exists()
+    (arms / "clarity_tests.csv").rename(runs / "clarity_tests.csv")  # the last RUNS folder's
     with open(runs / "clarity_tests.csv", newline="") as f:
         rows = list(csv.DictReader(f))
     assert {r["test"] for r in rows} == set(E.TESTS)
-    clarity = {"seed0/real", "seed0/sim", "seed1/real", "seed1/sim"}
+    clarity = {"seed0/real", "seed0/sim", "seed1/real", "seed1/sim", "seed0/chain", "seed0/fixed"}
     assert clarity <= {r["model"] for r in rows}
     assert {r["model"] for r in rows if r["set"] == "heo_test"} == clarity | {"ocm4"}
+    eaglet = {r["model"] for r in rows if r["set"] == "eaglet2"}
+    assert "seed0/fixed" in eaglet  # with blue for its near infrared
     cameras = {r["scene"] for r in rows if r["test"] == "A"}
     assert len(cameras) == 23 and "sentinel2" in cameras
     for r in rows:
@@ -421,6 +445,7 @@ def test_the_command(data, tmp_path, capsys):
         assert len(counts) == 24 and sum(counts) == int(r["pixels"]) > 0
     out = capsys.readouterr().out
     assert "Clarity real (2 seeds)" in out and "Clarity sim (2 seeds)" in out
+    assert "Clarity + MTF, SNR (1 seed)" in out and "U-Net fixed bands (1 seed)" in out
     assert "4 cameras beyond the range" in out and "Test D: IRIDE HEO test scenes" in out
     with pytest.raises(SystemExit):
         E.parse_args([str(runs), "--a-size", "40"])
@@ -468,5 +493,7 @@ def test_omnicloudmask_beside_on_landsat(data, monkeypatch):
 
 def test_default_out(tmp_path):
     assert E.default_out(tmp_path, list(E.TESTS), False) == tmp_path / "clarity_tests.csv"
+    two = [tmp_path / "big", tmp_path / "arms"]
+    assert E.default_out(two, list(E.TESTS), False) == tmp_path / "arms" / "clarity_tests.csv"
     assert E.default_out(tmp_path, ["E", "D"], False).name == "clarity_tests_DE.csv"
     assert E.default_out(tmp_path, ["B", "C", "D", "E"], True).name == "clarity_tests_BCDE_ocm.csv"
