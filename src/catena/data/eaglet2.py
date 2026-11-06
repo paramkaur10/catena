@@ -14,21 +14,24 @@ each labelled scene's median and top reflectance per band (slow: it reads every 
 
 The product zip holds one image of three bands, uint16: 1 red (about 665-835 nm, reaching
 into the near infrared), 2 green, 3 blue. Reflectance = DN x gain + offset, with a gain and an
-offset per band and per product, not clipped at 1; DN 0 is no data. The STAC item gives them
-(assets, raster:bands: scale and offset), and so does the XML (GAIN and OFFSET, one per band
-in the band order); gains() reads both and stops if they disagree by more than 1%, so a wrong
-reading cannot pass unseen, and uses the XML's. read() brings the bands onto the label's grid
-exactly as the drafts and the labels were made (catena.drafts.on_grid: the mean of the valid
-pixels in each 5 m cell), then applies the gains; a pixel where a band has no data gets no
-label. What the model is told: the band edges (iride_eaglet2.yaml), 5 m pixels, top of
-atmosphere.
+offset per band and per product, not clipped at 1; DN 0 is no data. The XML gives them in full
+(GAIN and OFFSET, one per band in the band order), the STAC item rounded (assets, raster:bands:
+scale and offset; the gains to two significant figures, 1.7e-05 for the XML's 1.7463e-05).
+gains() reads both and stops unless every STAC value is the XML's rounded to the digits the
+STAC item writes, so a swapped band or other units cannot pass unseen, and uses the XML's.
+read() brings the bands onto the label's grid exactly as the drafts and the labels were made
+(catena.drafts.on_grid: the mean of the valid pixels in each 5 m cell), then applies the gains;
+a pixel where a band has no data gets no label. What the model is told: the band edges
+(iride_eaglet2.yaml), 5 m pixels, top of atmosphere.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import decimal
 import json
+import math
 import re
 import zipfile
 from dataclasses import dataclass
@@ -131,12 +134,20 @@ def metadata(product: Path) -> dict:
     return {"stac": stac, "xml": from_xml(text)}
 
 
+def rounded(short: float, full: float) -> bool:
+    """short is full rounded to the digits short is written with: 1.7e-05 is 1.7463e-05 to
+    two significant figures, 1.8e-05 is not."""
+    if not (math.isfinite(short) and math.isfinite(full)):
+        return False
+    last = decimal.Decimal(repr(float(short))).as_tuple().exponent  # the last digit's place
+    return abs(full - short) <= 0.5 * 10.0 ** int(last) * (1 + 1e-9) + 1e-15
+
+
 def agree(stac, xml) -> bool:
-    """The same gains and offsets, to 1% (an offset to 1e-4 in reflectance)."""
-    return bool(
-        np.allclose(stac[0], xml[0], rtol=0.01, atol=0.0)
-        and np.allclose(stac[1], xml[1], rtol=0.01, atol=1e-4)
-    )
+    """Every gain and offset of the STAC item is the XML's, rounded to the STAC item's
+    digits."""
+    pairs = zip(np.concatenate(stac), np.concatenate(xml), strict=True)
+    return all(rounded(float(s), float(x)) for s, x in pairs)
 
 
 def gains(product: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -198,19 +209,24 @@ def main(argv: list[str] | None = None) -> None:
         return "  ".join(f"{g:.4e} {o:+.5f}" for g, o in zip(*pair, strict=True))
 
     print(f"{len(zips)} products; per band (red, green, blue): gain offset")
-    agree = 0
+    agreed = 0
     for product in zips:
         found = metadata(product)
         try:
             gains(product)
             state = "ok" if None not in found.values() else "one source only"
-            agree += state == "ok"
         except ValueError as e:
             state = f"PROBLEM: {e}"
+        if state == "ok":
+            agreed += 1
+            stac, xml = found["stac"][0], found["xml"][0]
+            worst = float(np.max(np.abs(stac - xml) / np.abs(xml)))
+            if worst > 1e-6:
+                state += f" (the STAC item's gains rounded, by up to {worst:.1%})"
         print(f"\n{product.stem[:32]}  {state}")
         print(f"   STAC {numbers(found['stac'])}")
         print(f"   XML  {numbers(found['xml'])}")
-    print(f"\n{agree} of {len(zips)} products: the STAC item and the XML agree")
+    print(f"\n{agreed} of {len(zips)} products: the STAC item and the XML agree")
     if args.read:
         print("\nreflectance per band (red, green, blue): median, top")
         for scene in scenes(args.data):

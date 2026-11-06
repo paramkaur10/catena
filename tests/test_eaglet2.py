@@ -111,8 +111,13 @@ def test_gains(tmp_path):
     assert eaglet2.gains(stac_only)[0] == pytest.approx(GAIN)
     xml_only = product(tmp_path / "c", None, xml())
     assert eaglet2.gains(xml_only)[1] == pytest.approx(OFFSET)
-    near = product(tmp_path / "d", stac(scale=[1.004 * g for g in GAIN]), xml())
-    assert eaglet2.gains(near)[0] == pytest.approx(GAIN)  # within 1%: the XML's
+    full = ([1.74632311e-05, 1.48511197e-05, 2.30016455e-05], [-0.00080327, 0.00244834, 0.00288029])
+    short = ([1.7e-05, 1.5e-05, 2.3e-05], [-0.000803, 0.002448, 0.00288])  # IME08's STAC item
+    real = product(tmp_path / "d", stac(*short), xml(*full))
+    assert eaglet2.gains(real)[0] == pytest.approx(full[0])  # the XML's, in full
+    one_off = product(tmp_path / "g", stac([1.8e-05, 1.5e-05, 2.3e-05], short[1]), xml(*full))
+    with pytest.raises(ValueError, match="disagree"):
+        eaglet2.gains(one_off)
     swapped = product(tmp_path / "e", stac(scale=GAIN[::-1]), xml())
     with pytest.raises(ValueError, match="disagree"):
         eaglet2.gains(swapped)
@@ -120,6 +125,16 @@ def test_gains(tmp_path):
         eaglet2.gains(product(tmp_path / "f", {"assets": {}}, "<PRODUCT/>"))
     tagged = '<a:GAIN band="1"> 1.0e-5 </a:GAIN><ANALOG_GAIN>4</ANALOG_GAIN>'
     assert eaglet2.from_xml(tagged * 3 + "<OFFSET>0</OFFSET>" * 3)[0] == pytest.approx([1e-5] * 3)
+
+
+def test_rounded():
+    assert eaglet2.rounded(1.7e-05, 1.74632311e-05)  # to two significant figures
+    assert eaglet2.rounded(1.5e-05, 1.48511197e-05) and eaglet2.rounded(0.00288, 0.00288029)
+    assert eaglet2.rounded(1.7463e-05, 1.74632311e-05) and eaglet2.rounded(2.0, 2.0)
+    assert not eaglet2.rounded(1.8e-05, 1.74632311e-05)  # a wrong digit
+    assert not eaglet2.rounded(1.7464e-05, 1.74632311e-05)  # more digits, and off
+    assert not eaglet2.rounded(2.3e-05, 1.74632311e-05)  # another band
+    assert not eaglet2.rounded(float("nan"), 1.0)
 
 
 def test_scenes_and_reading_one(data):
@@ -155,4 +170,4 @@ def test_the_probe(data, capsys):
     eaglet2.main([str(data), "--read"])
     out = capsys.readouterr().out
     assert "1 of 1 products: the STAC item and the XML agree" in out
-    assert "1.9200e-05 -0.00080" in out and SCENE in out
+    assert "1.9200e-05 -0.00080" in out and SCENE in out and "rounded" not in out
