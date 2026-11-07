@@ -42,22 +42,37 @@ the best trunks and the command that trains the best two end to end (train_clari
 A candidate that fails (out of memory, an error) scores 0 and the search goes on. A fault on
 the GPU (CUDA) is different: it breaks the process's hold on the GPU for good, or takes the
 process down at once, so the process stops (exit 3, or the fault's own). trying.json, written
-before each candidate trains, names the one it was on. Started again (scripts/search.sh does
-so), the search trains that candidate once more; if it stops on it a second time (TRIES), it
-scores the candidate 0, leaves it out and goes on. Each failed candidate gets a line in
-search.jsonl with its reason (failed), and is never trained again.
+before each candidate trains, names the one it was on, and how many times it was started.
+Started again (scripts/search.sh does so), the search trains that candidate again, one level
+of caution up (LEVELS), with every GPU kernel launched one at a time (CUDA_LAUNCH_BLOCKING=1),
+so a fault that comes back is raised at the very operation that made it and its traceback
+goes to the log:
+  0  as fast as it goes: bfloat16, pinned data, fused attention kernels;
+  1  float32, data not pinned, attention by its formula (no fused kernel, no fast path);
+  2  as 1, and convolutions without cuDNN.
+A candidate trained so is scored as any other (its line says how: rescued, caution); the
+process then stops (exit 4) and is started again without the slow launches, and from then on
+the search trains every candidate at the level that worked (caution.json). A candidate that
+stopped the process at the last level too, kernels one at a time, scores 0, is left out and
+is never trained again; each failed candidate gets a line in search.jsonl with its reason
+(failed). If GIVE_UP candidates are left out so and none has been scored, the fault is in what
+they all share, not in their trunks: the search gives up (exit 5), so a GPU fault costs
+minutes, not the days of a search. A search stopped by hand (tmux closed, kill, Ctrl-C) trains
+the candidate it was on afresh when started again, at the level it had.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import faulthandler
 import json
 import logging
 import math
 import os
 import platform
 import random
+import signal
 import sys
 import time
 import traceback
@@ -80,7 +95,14 @@ from catena.model import BandEncoder, count_parameters
 
 CONFIG = Path(__file__).with_name("pynas.ini")
 TRYING = "trying.json"  # the candidate being trained, while it is
-TRIES = 2  # a candidate the process stopped on this many times is left out
+CAUTION = "caution.json"  # the level of caution the search has needed, once it needed one
+LEVELS = (
+    "bfloat16, pinned data, fused attention",
+    "float32, data not pinned, attention by its formula",
+    "float32, data not pinned, attention by its formula, convolutions without cuDNN",
+)
+LEFT_OUT = "it took the process down (a fault on the GPU)"
+GIVE_UP = 3  # this many left out so, and none scored: the fault is not the trunks'
 CLASSES = 4
 BYTES = 2  # a parameter at float16
 TILE = 240  # the speed is measured on tiles of this size
@@ -176,6 +198,14 @@ class Candidate(nn.Module):
         if fixed:
             self.head.requires_grad_(False)
 
+    def train(self, mode: bool = True):
+        """A fixed band encoder stays in eval mode while the trunk trains, as a frozen
+        encoder should: its features as it gives them in use (no dropout)."""
+        super().train(mode)
+        if self.fixed:
+            self.head.eval()
+        return self
+
     def forward(self, x, told, real):
         with torch.set_grad_enabled(torch.is_grad_enabled() and not self.fixed):
             features, _ = self.head(x, told, real)
@@ -218,11 +248,15 @@ def smallest(args) -> int:
 
 class Trainer:
     """Trains a candidate on the sim version's samples and scores it on the validation
-    cameras; every candidate gets the same samples. Writes a line of search.jsonl for each."""
+    cameras; every candidate gets the same samples. Writes a line of search.jsonl for each.
+    level: of caution (LEVELS); from 1, float32 and data not pinned (careful() sets the rest
+    for the whole process)."""
 
-    def __init__(self, args, device: torch.device, record: Path):
-        self.args, self.device, self.record = args, device, record
-        self.amp = device.type == "cuda" and not args.no_amp and torch.cuda.is_bf16_supported()
+    def __init__(self, args, device: torch.device, record: Path, level: int = 0):
+        self.args, self.device, self.record, self.level = args, device, record, level
+        cuda = device.type == "cuda" and level == 0
+        self.amp = cuda and not args.no_amp and torch.cuda.is_bf16_supported()
+        self.note = None  # said in the line of a candidate trained again after a fault
         self.weights = T.CODE_WEIGHTS.to(device)
         windows, data = C.training_data(args)
         samples = C.Samples(
@@ -239,7 +273,7 @@ class Trainer:
         checks = T.ValSamples(
             loader.GridWindows(s2, "validation", size=args.size), args.val_windows
         )
-        pin = device.type == "cuda"
+        pin = cuda
         more = {"persistent_workers": True, "prefetch_factor": 4} if args.workers else {}
         self.train = DataLoader(
             samples,
@@ -335,6 +369,10 @@ class Trainer:
         result["loss"] = round(float(np.mean(losses[-100:])), 4) if losses else None
         result["ms_per_tile"] = round(self.speed(net, batch=8 if device.type == "cuda" else 1), 3)
         result["seconds"] = round(time.perf_counter() - began, 1)
+        if self.level:
+            result["caution"] = LEVELS[self.level]
+        if self.note:
+            result["rescued"] = self.note
         result["per_camera"] = {
             name: {k: round(v, 4) for k, v in s.items() if math.isfinite(v)}
             for name, s in per_camera.items()
@@ -374,6 +412,7 @@ def search_class():
                 save_directory=str(out),
             )
             self.cfg = found.config.load_config(CONFIG)  # what it prints: fp32, as trained here
+            self.retry = False  # main(): this process trains again the one the last stopped on
 
         def setup_logger(self, *_args, **_kwargs):
             """PyNAS's log, in OUT (PyNAS writes ../logs/population.log)."""
@@ -405,12 +444,17 @@ def search_class():
             individual.architecture = code  # PyNAS leaves it as first drawn
             torch.manual_seed(self.args.seed)  # every trunk from the same start
             net, _ = self.build_model(individual.parsed_layers)
-            marker = Path(self.save_directory) / TRYING
+            out = Path(self.save_directory)
+            marker = out / TRYING
             before = json.loads(marker.read_text()) if marker.exists() else {}
             again = (before.get("generation"), before.get("index")) == (self.generation, idx)
             tries = 1 + int(before.get("tries", 1)) if again else 1  # the last run stopped on it
             trying = {"generation": self.generation, "index": idx, "code": code, "tries": tries}
             marker.write_text(json.dumps(trying))
+            retry = again and self.retry  # this process was started to train it again
+            if retry:
+                faults = "a fault" if tries == 2 else f"{tries - 1} faults"
+                self.trainer.note = f"trained again after {faults}, kernels one at a time"
             why = None
             try:
                 result = self.trainer(net, self.generation, idx, code)
@@ -430,6 +474,9 @@ def search_class():
                 net.to("cpu")
                 torch.cuda.empty_cache()
                 result = self.trainer.failed(self.generation, idx, code, net, why)
+            elif retry and self.trainer.level > caution(out):  # the level that worked
+                raise_caution(out, self.trainer.level, self.generation, idx, code)
+            self.trainer.note = None
             marker.unlink(missing_ok=True)
             individual.fitness = float(result["fitness"])
             individual.metric = result.get("cloud_ba")
@@ -447,6 +494,15 @@ def search_class():
                 self.df.loc[idx, column] = value
             self.save_dataframe()
             self.save_population()
+            if retry:  # done; the rest in a process without the slow launches
+                level = caution(out)
+                print(
+                    f"  gen {self.generation} #{idx}: trained again; starting again, caution "
+                    f"{level} ({LEVELS[level]})",
+                    flush=True,
+                )
+                sys.stdout.flush()
+                os._exit(4)
             return result
 
     return Search
@@ -458,21 +514,76 @@ def last_generation(out: Path) -> int | None:
     return max(found) if found else None
 
 
-def leave_out(pop, out: Path, record: Path, tries: int = TRIES) -> None:
-    """The candidate the last run stopped on (trying.json, of this generation): the first
-    time, it is trained once more; after `tries` times, it is scored 0, marked scored and left
-    out, since it takes the process down."""
+def caution(out: Path) -> int:
+    """The level of caution (LEVELS) the search trains at: 0, or the level that trained a
+    candidate the process had stopped on (caution.json)."""
+    path = out / CAUTION
+    return int(json.loads(path.read_text())["level"]) if path.exists() else 0
+
+
+def raise_caution(out: Path, level: int, generation: int, index: int, code: str) -> None:
+    """The search's level of caution from now on: the one that trained a candidate the process
+    had stopped on."""
+    found = {"level": level, "settings": LEVELS[level]}
+    found |= {"since_utc": datetime.now(UTC).isoformat(timespec="seconds")}
+    found |= {"found_with": {"generation": generation, "index": index, "code": code}}
+    (out / CAUTION).write_text(json.dumps(found) + "\n")
+
+
+def allowed(level: int) -> int:
+    """How many times a candidate may stop the process, at the search's level of caution,
+    before it is left out: until it has stopped it at the last level, kernels one at a time."""
+    return max(2, len(LEVELS) - level)
+
+
+def plan(out: Path) -> tuple[int, bool]:
+    """This process's level of caution, and whether it launches the GPU's kernels one at a
+    time: the search's level; or, to train again the candidate the last run stopped on
+    (trying.json) and not to leave out yet, one level up per time it stopped, one at a time."""
+    level = caution(out)
+    marker = out / TRYING
+    if marker.exists():
+        tries = int(json.loads(marker.read_text()).get("tries", 1))
+        if tries < allowed(level):
+            return min(level + tries, len(LEVELS) - 1), True
+    return level, False
+
+
+def careful(level: int) -> None:
+    """The settings of a level of caution that are the whole process's: from 1, attention by
+    its formula (no fused kernel; no fast path of the Transformer layer); from 2, no cuDNN.
+    The Trainer sets float32 and unpinned data."""
+    if level >= 1:
+        for switch in ("enable_flash_sdp", "enable_mem_efficient_sdp", "enable_cudnn_sdp"):
+            if hasattr(torch.backends.cuda, switch):
+                getattr(torch.backends.cuda, switch)(False)
+        mha = getattr(torch.backends, "mha", None)
+        if mha is not None and hasattr(mha, "set_fastpath_enabled"):
+            mha.set_fastpath_enabled(False)
+    if level >= 2:
+        torch.backends.cudnn.enabled = False
+
+
+def leave_out(pop, out: Path, record: Path) -> bool:
+    """The candidate the last run stopped on (trying.json, of this generation): trained again,
+    one level of caution up, until it has stopped the process at the last level too
+    (allowed()); then it is scored 0, marked scored and left out. True if it was left out."""
     marker = out / TRYING
     if not marker.exists():
-        return
+        return False
     found = json.loads(marker.read_text())
     idx = found.get("index", -1)
     if found.get("generation") != pop.generation or not 0 <= idx < len(pop.population):
         marker.unlink()
-        return
-    if int(found.get("tries", 1)) < tries:  # run_precision_suite counts the tries
-        print(f"  gen {pop.generation} #{idx}: the last run stopped on it; once more", flush=True)
-        return
+        return False
+    if int(found.get("tries", 1)) < allowed(caution(out)):  # run_precision_suite counts them
+        level, _ = plan(out)
+        print(
+            f"  gen {pop.generation} #{idx}: the last run stopped on it; again, caution {level} "
+            f"({LEVELS[level]}), kernels one at a time",
+            flush=True,
+        )
+        return False
     marker.unlink()
     individual = pop.population[idx]
     individual.fitness = 0.0
@@ -486,10 +597,36 @@ def leave_out(pop, out: Path, record: Path, tries: int = TRIES) -> None:
     if getattr(individual, "model_size", None):
         line["parameters"] = int(individual.model_size)
         line["mb"] = round(BYTES * line["parameters"] / 1e6, 3)
-    line["failed"] = "it took the process down (a fault on the GPU)"
+    line["failed"] = LEFT_OUT
     with open(record, "a") as f:
         f.write(json.dumps(line) + "\n")
     print(f"  gen {pop.generation} #{idx}: {line['failed']}; scored 0, left out", flush=True)
+    return True
+
+
+def stopping(out: Path) -> None:
+    """A process stopped by hand (tmux closed, kill, Ctrl-C) forgets the candidate it was on,
+    which is trained afresh when the search is started again: only a fault on the GPU (which
+    leaves trying.json) moves a candidate a level of caution up."""
+
+    def stop(signum, _frame):
+        (out / TRYING).unlink(missing_ok=True)
+        os._exit(128 + signum)
+
+    for name in ("SIGHUP", "SIGINT", "SIGTERM"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), stop)
+
+
+def given_up(record: Path) -> bool:
+    """GIVE_UP candidates or more left out for stopping the process at every level of caution,
+    and none scored: the fault is in what every candidate shares (the band encoder, the data,
+    the loss, the GPU), not in their trunks."""
+    if not record.exists():
+        return False
+    rows = [json.loads(line) for line in record.read_text().splitlines() if line.strip()]
+    downs = sum(r.get("failed") == LEFT_OUT for r in rows)
+    return downs >= GIVE_UP and not any(not r.get("failed") for r in rows)
 
 
 def best(record: Path, n: int = 10) -> list[dict]:
@@ -574,6 +711,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     args.out.mkdir(parents=True, exist_ok=True)
+    if not faulthandler.is_enabled():  # a fault that kills the process at once: where it was
+        try:
+            faulthandler.enable()
+        except (AttributeError, OSError, RuntimeError, ValueError):  # stderr is not a file
+            pass
+    if argv is None:  # the command: a stop by hand is not a fault to step up from
+        stopping(args.out)
+    level, one_at_a_time = plan(args.out)
+    if one_at_a_time:  # read by CUDA when it starts, so before anything touches the GPU
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    careful(level)
     random.seed(args.seed)  # PyNAS draws with random and numpy
     np.random.seed(args.seed)  # noqa: NPY002  (PyNAS draws from numpy's global generator)
     torch.manual_seed(args.seed)
@@ -600,21 +748,36 @@ def main(argv: list[str] | None = None) -> None:
         config = json.loads(previous.read_text()) | {"resumed_utc": config["started_utc"]}
     previous.write_text(json.dumps(config, indent=2) + "\n")
 
-    trainer = Trainer(args, device, record)
+    trainer = Trainer(args, device, record, level)
     pop = search_class()(args.out, head, trainer, args, size)
+    pop.retry = one_at_a_time
     print(
         f"search: {args.population} trunks x {args.generations} generations behind the "
         f"{args.arm} head of {args.head} ({config['head_parameters']:,} parameters); "
-        f"budget {args.budget_mb} MB; checked at {size} px; {args.steps} steps each on {device}",
+        f"budget {args.budget_mb} MB; checked at {size} px; {args.steps} steps each on "
+        f"{device}; caution {level} ({LEVELS[level]})"
+        + ("; kernels one at a time" if one_at_a_time else ""),
         flush=True,
     )
     g = last_generation(args.out)
-    if g is None:
-        pop.initial_poll()
+    if g is None:  # a new search: no candidate to train again
+        (args.out / TRYING).unlink(missing_ok=True)
     else:  # going on: PyNAS skips the candidates its dataframe has a fitness for
         pop.population, pop.df, pop.generation = pop.load_population(g), pop.load_dataframe(g), g
         print(f"going on from generation {g}", flush=True)
-        leave_out(pop, args.out, record)
+        if leave_out(pop, args.out, record) and given_up(record):
+            print(
+                f"the search gives up: {GIVE_UP} or more candidates stopped the process at every "
+                "level of caution and none was scored, so the fault is in what they all share "
+                "(the band encoder, the data, the loss, the GPU), not in their trunks; the "
+                "tracebacks above, kernels one at a time, name the operation",
+                flush=True,
+            )
+            raise SystemExit(5)
+    if one_at_a_time and not (args.out / TRYING).exists():
+        raise SystemExit(4)  # nothing to train again after all: started again as usual
+    if g is None:
+        pop.initial_poll()
     while True:
         pop.train_generation(task="segmentation", lr=args.lr, epochs=0, batch_size=args.batch)
         if pop.generation + 1 >= args.generations:

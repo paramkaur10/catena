@@ -1,8 +1,9 @@
 """The architecture search behind the descriptor head: PyNAS's trunks behind a band encoder,
 for any window size and with GroupNorm; a run's head, kept as it is; crossover that leaves the
 parents alone; a tiny search on made-up data (CPU), gone on with, and its candidates that fail
-(out of memory; a fault on the GPU, tried again, then left out); and a trunk it finds, trained
-as an arm and tested. Needs PyNAS (py-q-nas) installed: skipped without it."""
+(out of memory; a fault on the GPU, trained again a level of caution up, then left out; the
+search giving up); and a trunk it finds, trained as an arm and tested. Needs PyNAS
+(py-q-nas) installed: skipped without it."""
 
 from __future__ import annotations
 
@@ -56,7 +57,8 @@ def test_the_head_of_a_run_stays_as_it_is(tmp_path):
     head = nas.load_head(tmp_path / "final.pt", "sim")
     for k, v in models["sim"].bands.state_dict().items():
         assert torch.equal(head.state_dict()[k], v)
-    net = nas.Candidate(head, nas.build_trunk(CODE, 16, size=24), fixed=True)
+    net = nas.Candidate(head, nas.build_trunk(CODE, 16, size=24), fixed=True).train()
+    assert net.trunk.training and not net.head.training  # a fixed head: no dropout
     net(*batch(4, 24)).square().mean().backward()
     assert all(p.grad is None for p in net.head.parameters())
     assert all(p.grad is not None for p in net.trunk.parameters())
@@ -96,6 +98,45 @@ def test_the_best_trunks_of_several_searches(tmp_path):
     assert nas.top_codes([a, b, tmp_path / "missing.jsonl"]) == ["A", "D"]
     assert nas.top_codes([a], 5) == ["B", "A"]
     assert nas.top_codes([tmp_path / "missing.jsonl"]) == []
+
+
+def test_the_levels_of_caution():
+    sdp, mha = torch.backends.cuda, getattr(torch.backends, "mha", None)
+    names = [
+        n for n in ("flash_sdp", "mem_efficient_sdp", "cudnn_sdp") if hasattr(sdp, f"{n}_enabled")
+    ]
+    was = {n: getattr(sdp, f"{n}_enabled")() for n in names}
+    fast = mha.get_fastpath_enabled() if mha is not None else None
+    cudnn = torch.backends.cudnn.enabled
+    try:
+        nas.careful(0)  # as fast as it goes: nothing changed
+        assert all(getattr(sdp, f"{n}_enabled")() == was[n] for n in names)
+        assert torch.backends.cudnn.enabled == cudnn
+        nas.careful(1)  # attention by its formula
+        assert names and not any(getattr(sdp, f"{n}_enabled")() for n in names)
+        assert sdp.math_sdp_enabled() and torch.backends.cudnn.enabled == cudnn
+        assert mha is None or not mha.get_fastpath_enabled()
+        nas.careful(2)  # and no cuDNN
+        assert not torch.backends.cudnn.enabled
+    finally:  # the whole process's settings: as they were, for the other tests
+        for n, v in was.items():
+            getattr(sdp, f"enable_{n}")(v)
+        if mha is not None:
+            mha.set_fastpath_enabled(fast)
+        torch.backends.cudnn.enabled = cudnn
+    assert [nas.allowed(level) for level in range(len(nas.LEVELS))] == [3, 2, 2]
+
+
+def test_a_stop_by_hand_is_not_a_fault(tmp_path, monkeypatch):
+    handlers, exits = {}, []
+    monkeypatch.setattr(nas.signal, "signal", lambda s, f: handlers.setdefault(s, f))
+    monkeypatch.setattr(nas.os, "_exit", exits.append)
+    nas.stopping(tmp_path)
+    assert {nas.signal.SIGHUP, nas.signal.SIGINT, nas.signal.SIGTERM} <= set(handlers)
+    (tmp_path / nas.TRYING).write_text(json.dumps({"generation": 0, "index": 3, "tries": 1}))
+    handlers[nas.signal.SIGHUP](nas.signal.SIGHUP, None)  # tmux closed
+    assert exits == [128 + nas.signal.SIGHUP] and not (tmp_path / nas.TRYING).exists()
+    assert nas.plan(tmp_path) == (0, False)  # trained afresh, at the search's level
 
 
 def test_a_tiny_search(data, tmp_path, monkeypatch):  # noqa: F811
@@ -146,43 +187,64 @@ def test_a_tiny_search(data, tmp_path, monkeypatch):  # noqa: F811
         raise SystemExit(code)
 
     fault = RuntimeError("CUDA error: unspecified launch failure")
+    levels: list[int] = []  # careful()'s settings are the whole process's: noted, not made
+    monkeypatch.setattr(nas, "careful", levels.append)
+    monkeypatch.setenv("CUDA_LAUNCH_BLOCKING", "0")  # a retry sets it; put back after the test
     not_trained(0)  # out of memory: scored 0, and the search goes on
     with monkeypatch.context() as m:
         m.setattr(nas.Trainer, "__call__", failing(torch.OutOfMemoryError("out of memory")))
         nas.main(args)
     assert lines()[-1]["index"] == 0 and lines()[-1]["failed"] == "out of memory"
-    assert len(lines()) == 9 and not marker.exists()
-    not_trained(1)  # a fault on the GPU: the process stops, then trains it once more
+    assert len(lines()) == 9 and not marker.exists() and levels[-1] == 0
+    not_trained(1)  # a fault on the GPU: the process stops, then trains it again
     with monkeypatch.context() as m:
         m.setattr(nas.Trainer, "__call__", failing(fault))
         m.setattr(nas.os, "_exit", stop)
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit) as stopped:
             nas.main(args)
+    assert stopped.value.code == 3 and nas.os.environ["CUDA_LAUNCH_BLOCKING"] == "0"
     assert json.loads(marker.read_text()) | {"code": ""} == {
         "generation": 1,
         "index": 1,
         "code": "",
         "tries": 1,
     }
-    nas.main(args)
+    with monkeypatch.context() as m:  # again, a level of caution up, kernels one at a time
+        m.setattr(nas.os, "_exit", stop)
+        with pytest.raises(SystemExit) as stopped:
+            nas.main(args)
+    assert stopped.value.code == 4 and nas.os.environ["CUDA_LAUNCH_BLOCKING"] == "1"
+    assert levels[-1] == 1 and nas.caution(out) == 1  # the search's level from now on
     assert len(lines()) == 10 and lines()[-1]["index"] == 1 and "failed" not in lines()[-1]
-    assert not marker.exists()
-    not_trained(2)  # stopped on twice: left out, not trained again
+    assert lines()[-1]["caution"] == nas.LEVELS[1] and not marker.exists()
+    assert lines()[-1]["rescued"] == "trained again after a fault, kernels one at a time"
+    monkeypatch.setenv("CUDA_LAUNCH_BLOCKING", "0")
+    not_trained(2)  # at caution 1: stops it, then again at 2 one at a time: left out
     with monkeypatch.context() as m:
         m.setattr(nas.Trainer, "__call__", failing(fault))
         m.setattr(nas.os, "_exit", stop)
-        for _ in range(2):
-            with pytest.raises(SystemExit):
+        for level, blocking in ((1, "0"), (2, "1")):
+            with pytest.raises(SystemExit) as stopped:
                 nas.main(args)
+            assert stopped.value.code == 3 and levels[-1] == level
+            assert nas.os.environ["CUDA_LAUNCH_BLOCKING"] == blocking
     assert json.loads(marker.read_text())["tries"] == 2
     nas.main(args)
     assert len(lines()) == 11 and lines()[-1]["index"] == 2 and lines()[-1]["steps"] == 0
-    assert lines()[-1]["failed"].startswith("it took the process down") and not marker.exists()
+    assert lines()[-1]["failed"] == nas.LEFT_OUT and not marker.exists() and levels[-1] == 1
     fitness = pd.read_pickle(frame)["Fitness"]
     assert fitness[0] == fitness[2] == pytest.approx(1e-9) and fitness.notna().all()
     nas.main(args)  # nothing left to train
     assert len(lines()) == 11
     assert all(r["code"] for r in nas.best(out / "search.jsonl"))
+    # a third left out so, with none scored (as made here): the search gives up
+    down = {"generation": 0, "index": 9, "code": "x", "steps": 0, "failed": nas.LEFT_OUT}
+    (out / "search.jsonl").write_text(2 * (json.dumps(down) + "\n"))
+    not_trained(3)
+    marker.write_text(json.dumps({"generation": 1, "index": 3, "code": "y", "tries": 2}))
+    with pytest.raises(SystemExit) as stopped:
+        nas.main(args)
+    assert stopped.value.code == 5 and len(lines()) == 3 and nas.given_up(out / "search.jsonl")
 
 
 def test_a_found_trunk_trained_and_tested(data, tmp_path):  # noqa: F811

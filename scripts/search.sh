@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # The architecture search (catena.nas), started again when a fault on the GPU stops it, up to
 # RESTARTS times (30). The search knows the candidate it stopped on (OUT/trying.json): it trains
-# it once more, and leaves it out (scored 0) if it stops on it again, so the search goes on.
+# it again one level of caution up, kernels one at a time (exit 4 when done: started again at
+# the level that worked), and leaves it out (scored 0) once it has stopped the process at the
+# last level too. It gives up (exit 5, not started again) when the fault is in what every
+# candidate shares: GIVE_UP left out so, none scored.
 #
 #     bash scripts/search.sh OUT --head RUN/seed0/final.pt [catena.nas options]
 #                                                 (inside tmux, from ~/projects/catena)
@@ -17,7 +20,11 @@ for TRY in $(seq 1 "$RESTARTS"); do
     if [ "$CODE" -eq 0 ]; then
         exit 0
     fi
-    if [ "$CODE" -ne 3 ] && [ "$CODE" -lt 128 ]; then
+    if [ "$CODE" -eq 5 ]; then
+        echo "$(date -u +%FT%TZ) catena.nas gave up (exit 5): see the tracebacks above" >&2
+        exit 5
+    fi
+    if [ "$CODE" -ne 3 ] && [ "$CODE" -ne 4 ] && [ "$CODE" -lt 128 ]; then
         echo "$(date -u +%FT%TZ) catena.nas failed (exit $CODE): not started again" >&2
         exit "$CODE"
     fi

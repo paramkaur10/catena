@@ -76,24 +76,27 @@ def labels_and_draft(rng, h: int, w: int, shadow: bool = True):
 
 
 def sentinel2(root) -> None:
-    """Two test patches of 128 px in D2's layout."""
+    """Two test patches and a validation one (the 8-bit calibration's) of 128 px in D2's
+    layout."""
     rows = []
-    for k in range(2):
+    for k, (split, name) in enumerate((("test", "t0"), ("test", "t1"), ("validation", "v2"))):
         rng = np.random.default_rng(k)
         geotiff(
-            root / "test" / f"t{k}.s2l1c.tif",
+            root / split / f"{name}.s2l1c.tif",
             rng.integers(500, 6000, (13, 128, 128)).astype(np.uint16),
             10,
         )
         geotiff(
-            root / "test" / f"t{k}.target.tif", rng.integers(0, 4, (128, 128)).astype(np.uint8), 10
+            root / split / f"{name}.target.tif",
+            rng.integers(0, 4, (128, 128)).astype(np.uint8),
+            10,
         )
         rows.append(
             {
-                "id": f"t{k}",
-                "split": "test",
-                "s2l1c_file": f"test/t{k}.s2l1c.tif",
-                "target_file": f"test/t{k}.target.tif",
+                "id": name,
+                "split": split,
+                "s2l1c_file": f"{split}/{name}.s2l1c.tif",
+                "target_file": f"{split}/{name}.target.tif",
                 "height": 128,
                 "width": 128,
                 "baseline": "02.07",
@@ -464,6 +467,46 @@ def test_scoring_a_set(data, tmp_path):
     assert "sensei2" in np.load(tmp_path / "more" / f"eaglet2__{EAGLET}.npz").files
 
 
+def test_averaging_by_area():
+    a = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    out = E.area_mean(a, (1, 2))
+    assert out.shape == (2, 1, 2)
+    assert np.allclose(out[1, 0], [a[1, :, :2].mean(), a[1, :, 2:].mean()])
+    assert np.allclose(E.area_mean(np.full((7, 9), 0.3, np.float32), (3, 4)), 0.3)
+    b = np.random.default_rng(0).random((10, 10)).astype(np.float32)
+    assert E.area_mean(b, (4, 3)).mean() == pytest.approx(b.mean(), rel=1e-5)  # any ratio
+    one = np.zeros((6, 6), np.float32)
+    one[0, 0] = 1
+    assert E.area_mean(one, (4, 4))[0, 0] == pytest.approx(1 / 2.25)  # a pixel cut by an edge
+
+
+def test_a_coarser_grid(data):
+    sets = {s.name: s for s in E.scene_sets(data, ["B", "D"])}
+    landsat = next(sets["landsat8"].items())
+    assert E.coarser(landsat, 10) is landsat  # 30 m: not finer than 10 m
+    heo = E.on_grid(sets["heo_test"], 10)
+    assert heo.name == "heo_test@10m" and "10 m grid" in heo.title
+    item = next(heo.items())
+    small = item.coarse
+    assert item.image.shape == (8, 60, 70) and small.image.shape == (8, 30, 35)
+    assert item.told[0, E.GSD_AT] == pytest.approx(-1) and item.label.shape == (60, 70)
+    assert np.allclose(small.told[:, E.GSD_AT], 0) and (small.told[:, E.SAMPLING_AT] >= 0).all()
+    assert np.array_equal(small.told[:, : E.GSD_AT], item.told[:, : E.GSD_AT])
+    rho = E.whole_scene(item)
+    expect = rho[:, 20:22, 30:32].mean(axis=(1, 2))
+    assert np.allclose(small.image[:, 10, 15], expect, rtol=1e-4)
+    assert item.upsample(np.arange(30 * 35).reshape(30, 35))[5, 7] == 2 * 35 + 3
+    rows, lines = E.score_set(heo, fake(30))
+    plain, _ = E.score_set(sets["heo_test"], fake(30))
+
+    def pixels(found):
+        return {r["model"]: r["pixels"] for r in found if r["scene"] == "all"}
+
+    assert pixels(rows) == pixels(plain) and set(pixels(rows)) == {"m", "m2", "ocm4"}
+    assert {r["set"] for r in rows} == {"heo_test@10m"}
+    assert any("predicted on a 10 m grid" in line for line in lines)
+
+
 # --- the command (torch) ----------------------------------------------------------------
 
 
@@ -535,6 +578,30 @@ def test_card_checks_on_the_command(data, tmp_path):
     assert len(a & {"sentinel2", "rgbn_10m_mtf0.3_snr150"}) == 2  # every camera, too
 
 
+def test_a_coarser_grid_and_8_bits_on_the_command(data, tmp_path):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("pynas")
+    from catena import train_clarity as C
+
+    runs = tmp_path / "small"
+    (runs / "seed0").mkdir(parents=True)
+    torch.manual_seed(0)
+    models = {a: C.build(a, (8, 8, 8, 8), 8) for a in ("sim", "fixed")}
+    C.save(runs / "seed0/final.pt", 1, models, {"args": {"widths": [8, 8, 8, 8], "stem": 8}})
+    args = [str(runs), "--data", str(data), "--device", "cpu", "--workers", "0"]
+    E.main([*args, "--tests", "D", "E", "F", "--grid", "10"])
+    with open(runs / "clarity_tests_DEF_grid10.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert {"heo_test@10m", "eaglet2@10m", "perusat1@10m"} <= {r["set"] for r in rows}
+    assert {"seed0/sim", "seed0/fixed"} <= {r["model"] for r in rows}
+    more = ["--windows", "2", "--a-size", "120", "--batch", "4", "--int8"]
+    E.main([*args, "--tests", "A", "F", *more])
+    with open(runs / "clarity_tests_AF_int8.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert {r["model"] for r in rows} == {"seed0/sim@int8", "seed0/fixed@int8"}
+    assert {r["test"] for r in rows} == {"A", "F"}
+
+
 def test_omnicloudmask_beside_on_landsat(data, monkeypatch):
     seen = []
 
@@ -585,3 +652,7 @@ def test_default_out(tmp_path):
     assert E.default_out(two, list(E.TESTS), False) == tmp_path / "arms" / "clarity_tests.csv"
     assert E.default_out(tmp_path, ["E", "D"], False).name == "clarity_tests_DE.csv"
     assert E.default_out(tmp_path, ["B", "C", "D", "E"], True).name == "clarity_tests_BCDE_ocm.csv"
+    grid = E.default_out(tmp_path, ["D", "E", "F"], False, grid=10)
+    assert grid.name == "clarity_tests_DEF_grid10.csv"
+    eight = E.default_out(tmp_path, list(E.TESTS), False, int8=True)
+    assert eight.name == "clarity_tests_ABCDEF_int8.csv"

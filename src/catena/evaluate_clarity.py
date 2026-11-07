@@ -3,7 +3,7 @@ test the method) on six test sets, beside OmniCloudMask wherever its predictions
 
     python -m catena.evaluate_clarity RUNS [RUNS ...] [--data /root/catena_data]
         [--tests A B C D E F] [--device cuda:0] [--windows 800] [--ocm] [--sensei] [--maps DIR]
-        [--out CSV] [--cards honest shuffled "pixel x3" ...]
+        [--out CSV] [--cards honest shuffled "pixel x3" ...] [--grid 10] [--int8]
 
 Each RUNS folder holds finished runs (final.pt) at any depth, one folder per seed, as
 scripts/big.sh makes them (runs/big/seed0, or runs/arms/chain/seed0 for OUT=runs/arms/chain);
@@ -85,6 +85,19 @@ wrong, and should hold up when bands go missing. Its rows are named <model>@<che
   blur x2           the blur told twice as wide where it is known
 Without --out, a run with checks other than honest writes clarity_tests_<tests>[_ocm]_cards.csv
 (and with SEnSeIv2, _sensei before .csv); the maps (--maps) keep the honest predictions only.
+
+A coarser working grid (--grid 10): every scene of B-F whose grid is finer than 10 m is
+predicted on a 10 m grid instead, as OmniCloudMask runs such imagery, so a 240 px tile holds
+2.4 km rather than 1.2 km at 5 m: a shadow and the cloud that casts it fit in one tile more
+often. Each band is averaged into the coarser pixels (by area, no-data pixels left out; a
+pixel more than half empty is no data), the cards are told the new grid (a band finer than
+it is averaged to it; a known blur shrinks, a known noise falls with the square root of the
+pixels averaged), and the prediction is brought back to the label's pixels (nearest), so the
+same pixels are scored. Sets are named <set>@10m; the CSV clarity_tests_<tests>_grid10.csv.
+
+8 bits (--int8): each network's 8-bit twin instead of it, named <model>@int8: PyNAS's
+simulation of the Hailo-8 contract on what runs on board for a fixed sensor, calibrated on
+the validation cameras (catena.onboard). The CSV clarity_tests_<tests>_int8.csv.
 """
 
 from __future__ import annotations
@@ -95,7 +108,7 @@ import math
 import time
 import traceback
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import pairwise
 from pathlib import Path
 
@@ -165,6 +178,8 @@ class Item:
     tile: int = TILE
     margin: int = MARGIN
     rgbn: tuple | None = None
+    coarse: Item | None = None  # predicted instead, on a coarser grid (--grid)
+    upsample: Callable[[np.ndarray], np.ndarray] | None = None  # its classes to the label's grid
 
 
 @dataclass
@@ -248,6 +263,7 @@ CARDS = (
     "blur x2",
 )
 GSD_AT, PSF_AT, NOISE_AT, KNOWN_PSF_AT, KNOWN_NOISE_AT = 5, 6, (7, 8), 9, 10  # in a chain card
+SAMPLING_AT = 4  # a band's pixel against the grid's, log2
 
 
 def _copied(a):
@@ -433,6 +449,82 @@ def whole_scene(item: Item) -> np.ndarray:
     return item.to_rho(np.ascontiguousarray(item.image[None]))[0].astype(np.float32)
 
 
+def area_axis(a: np.ndarray, n: int, axis: int) -> np.ndarray:
+    """The means of a over n equal stretches of an axis, a pixel cut by a stretch's edge
+    counted by the share of it inside (exact area averaging, for any ratio)."""
+    length = a.shape[axis]
+    total = np.cumsum(a, axis=axis, dtype=np.float64)
+    first = np.zeros_like(np.take(total, [0], axis=axis))
+    total = np.concatenate([first, total], axis=axis)  # the sum of the first k pixels, k = 0..
+    edges = np.arange(n + 1) * (length / n)
+    k = np.minimum(np.floor(edges).astype(int), length - 1)
+    shape = [1] * a.ndim
+    shape[axis] = n + 1
+    lower, upper = np.take(total, k, axis=axis), np.take(total, k + 1, axis=axis)
+    summed = lower + (upper - lower) * (edges - k).reshape(shape)
+    return (np.diff(summed, axis=axis) / (length / n)).astype(np.float32)
+
+
+def area_mean(a: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """a (..., H, W) averaged by area into (..., h, w)."""
+    return area_axis(area_axis(a, size[0], a.ndim - 2), size[1], a.ndim - 1)
+
+
+def coarser(item: Item, metres: float) -> Item:
+    """The item, to be predicted on a grid of `metres` when its own is finer (--grid): its
+    reflectance averaged into the coarser pixels by area, band by band, no-data pixels (every
+    band 0) left out and a pixel more than half empty made no data; its cards told the new
+    grid; a coarse label that only marks where labels are (the tiles to predict); and the way
+    back to the label's pixels (nearest). Scoring stays on the item's own label."""
+    told = np.array(item.told, np.float32, copy=True)
+    grid = 10 * 2 ** float(told[0, GSD_AT])
+    f = metres / grid
+    if f <= 1.01:
+        return item
+    rho = whole_scene(item)
+    _, h, w = rho.shape
+    size = (max(1, round(h / f)), max(1, round(w / f)))
+    valid = (rho > 0).any(axis=0)  # as scored: CloudPeru2's surface reflectance can be 0
+    share = area_mean(valid.astype(np.float32), size)
+    good = share > 0.5
+    image = np.zeros((rho.shape[0], *size), np.float32)
+    for b in range(rho.shape[0]):
+        summed = area_mean(np.where(valid, rho[b], 0).astype(np.float32), size)
+        image[b] = np.where(good, summed / np.maximum(share, 1e-6), 0)
+    labelled = area_mean((item.label != NO_LABEL).astype(np.float32), size) > 0
+    told[:, GSD_AT] = math.log2(metres / 10)
+    told[:, SAMPLING_AT] = np.maximum(told[:, SAMPLING_AT] - math.log2(f), 0)
+    told[:, PSF_AT] /= f  # an unknown blur (0) stays 0
+    known = told[:, KNOWN_NOISE_AT] > 0
+    told[known, NOISE_AT[0] : NOISE_AT[1] + 1] -= math.log10(f)  # f x f pixels averaged
+    rows = np.minimum(((np.arange(h) + 0.5) * size[0] / h).astype(int), size[0] - 1)
+    cols = np.minimum(((np.arange(w) + 0.5) * size[1] / w).astype(int), size[1] - 1)
+
+    def upsample(classes: np.ndarray) -> np.ndarray:
+        return classes[rows][:, cols]
+
+    small = Item(
+        item.name,
+        image,
+        told,
+        np.where(labelled, 0, NO_LABEL).astype(np.uint8),
+        shadow_ok=item.shadow_ok,
+        rgbn=item.rgbn,
+    )
+    return replace(item, coarse=small, upsample=upsample)
+
+
+def on_grid(ts: SceneSet, metres: float) -> SceneSet:
+    """A set whose scenes are predicted on a grid of `metres` where theirs is finer."""
+
+    def items() -> Iterator[Item]:
+        for item in ts.items():
+            yield coarser(item, metres)
+
+    title = f"{ts.title}, predicted on a {metres:g} m grid"
+    return replace(ts, name=f"{ts.name}@{metres:g}m", title=title, items=items)
+
+
 def some_bands(module, scene, dn: np.ndarray, bands, rows: int = 1024) -> np.ndarray:
     """The reflectance of a few bands of a Landsat scene (len(bands), H, W), a strip of rows
     at a time, so the whole scene is never in float32 at once."""
@@ -601,6 +693,7 @@ class Net:
     net: object
     fields: int
     blind: bool = False
+    amp: bool = True  # bfloat16 allowed (an 8-bit twin runs in float32)
 
 
 def load_runs(runs, device) -> dict[str, Net]:
@@ -660,7 +753,8 @@ def run_nets(nets: dict[str, Net], image, told, real, four, amp: bool) -> dict:
             inputs = (image[:, list(four)], None, None)
         else:
             inputs = (image, zeros if entry.blind else told, real)
-        with torch.autocast(device_type=image.device.type, dtype=torch.bfloat16, enabled=amp):
+        on = amp and entry.amp
+        with torch.autocast(device_type=image.device.type, dtype=torch.bfloat16, enabled=on):
             out[model] = entry.net(*inputs)
     return out
 
@@ -818,8 +912,11 @@ def score_set(
             continue
         started = time.perf_counter()
         preds = {}
+        work = item.coarse if item.coarse is not None else item
         for check in cards:
-            found = predict(checked(classify, check), item)
+            found = predict(checked(classify, check), work)
+            if item.coarse is not None:
+                found = {model: item.upsample(p) for model, p in found.items()}
             preds |= {named(model, check): p for model, p in found.items()}
         preds |= item.others
         if extra is not None:
@@ -935,20 +1032,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--cards", nargs="+", default=["honest"], choices=list(CARDS), help="card checks (above)"
     )
+    p.add_argument("--grid", type=float, help="predict sets finer than this (m) on a grid of it")
+    p.add_argument("--int8", action="store_true", help="each network's 8-bit twin instead of it")
     args = p.parse_args(argv)
     if args.a_size <= 0 or args.a_size % 24:
         p.error("--a-size must be a multiple of 24: of 8 at 10 m and at 30 m")
     return args
 
 
-def default_out(runs, tests, ocm: bool, cards=("honest",), sensei: bool = False) -> Path:
+def default_out(
+    runs, tests, ocm: bool, cards=("honest",), sensei: bool = False, grid=None, int8=False
+) -> Path:
     """In the (last) RUNS folder: clarity_tests.csv for the six tests, plainly told,
-    clarity_tests_<tests>[_ocm][_cards][_sensei].csv otherwise."""
+    clarity_tests_<tests>[_ocm][_cards][_sensei][_grid<m>][_int8].csv otherwise."""
     folder = Path(runs if isinstance(runs, str | Path) else runs[-1])
     checks = list(cards) != ["honest"]
-    if set(tests) == set(TESTS) and not ocm and not checks and not sensei:
+    plain = not ocm and not checks and not sensei and not grid and not int8
+    if set(tests) == set(TESTS) and plain:
         return folder / "clarity_tests.csv"
     more = ("_ocm" if ocm else "") + ("_cards" if checks else "") + ("_sensei" if sensei else "")
+    more += (f"_grid{grid:g}" if grid else "") + ("_int8" if int8 else "")
     return folder / f"clarity_tests_{''.join(sorted(tests))}{more}.csv"
 
 
@@ -960,8 +1063,14 @@ def main(argv: list[str] | None = None) -> None:
     amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
     torch.backends.cudnn.benchmark = True
     nets = load_runs(args.runs, device)
+    if args.int8:
+        from catena import onboard
+
+        nets = onboard.int8_twins(nets, args.data, device, args.workers, size=args.a_size)
     tests = [t for t in TESTS if t in args.tests]
-    out = args.out or default_out(args.runs, tests, args.ocm, args.cards, args.sensei)
+    out = args.out or default_out(
+        args.runs, tests, args.ocm, args.cards, args.sensei, args.grid, args.int8
+    )
     print(f"{len(nets)} networks ({', '.join(nets)}) on {device}; tests {' '.join(tests)}")
     if args.cards != ["honest"]:
         print(f"card checks: {', '.join(args.cards)}", flush=True)
@@ -1000,7 +1109,10 @@ def main(argv: list[str] | None = None) -> None:
         def extra(item: Item) -> dict:
             return {"sensei2": run_sensei(whole_scene(item), item.told)}
 
-    for ts in scene_sets(args.data, [t for t in tests if t != "A"], ocm):
+    sets = scene_sets(args.data, [t for t in tests if t != "A"], ocm)
+    if args.grid:
+        sets = [on_grid(ts, args.grid) for ts in sets]
+    for ts in sets:
         try:
             keep(*score_set(ts, classify, args.maps, args.cards, extra))
         except Exception:  # one broken set must not cost the others
