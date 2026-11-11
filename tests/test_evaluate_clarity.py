@@ -289,6 +289,45 @@ def fake(margin: int):
     return classify
 
 
+def pixelwise(x: np.ndarray, told: np.ndarray, rgbn=None) -> dict:
+    """A rule of each pixel alone: clear, thin or thick by its first band."""
+    return {"m": np.clip(np.floor(x[:, 0] * 3), 0, 2).astype(np.uint8)}
+
+
+def test_pixels_scrambled_and_put_back():
+    rng = np.random.default_rng(0)
+    image = rng.random((2, 300, 260)).astype(np.float32)
+    label = rng.integers(0, 4, (300, 260)).astype(np.uint8)
+    label[:, 200:] = E.NO_LABEL  # no label: those pixels stay where they are
+    told = np.zeros((2, desc.N_CHAIN_CARD), np.float32)
+    item = E.Item("x", image, told, label, tile=80, margin=10)
+    moved, where, order = E.scrambled(item)
+    assert not np.array_equal(moved.image, image) and moved.others == {}
+    assert np.array_equal(moved.image[:, :, 200:], image[:, :, 200:])
+    assert np.array_equal(np.sort(moved.label.ravel()), np.sort(label.ravel()))
+    assert np.array_equal(E.put_back(moved.label, where, order), label)
+    pixel = moved.image[:, where[5] // 260, where[5] % 260]  # a pixel keeps its bands
+    assert np.array_equal(pixel, image[:, where[order[5]] // 260, where[order[5]] % 260])
+    back = E.put_back(E.predict(pixelwise, moved)["m"], where, order)
+    ok = label != E.NO_LABEL
+    assert np.array_equal(back[ok], E.predict(pixelwise, item)["m"][ok])
+
+
+def test_a_rule_of_each_pixel_scores_the_same_scrambled(data):
+    heo = next(s for s in E.scene_sets(data, ["D"]) if s.name == "heo_test")
+    rows, lines = E.score_set(heo, pixelwise, cards=("honest", E.SCRAMBLED))
+    pooled = {r["model"]: r["confusion"] for r in rows if r["scene"] == "all"}
+    assert pooled["m"] == pooled["m@pixels scrambled"]  # each pixel alone: nothing changes
+    assert any("[pixels scrambled]" in line for line in lines)
+
+    def twice(x, told, rgbn=None):  # a network that reads where a pixel lies
+        return {"m": fake(30)(x, told, rgbn)["m"]}
+
+    rows, _ = E.score_set(heo, twice, cards=("honest", E.SCRAMBLED))
+    pooled = {r["model"]: r["confusion"] for r in rows if r["scene"] == "all"}
+    assert pooled["m"] != pooled["m@pixels scrambled"]
+
+
 def test_each_pixel_comes_from_the_tile_it_lies_deepest_in():
     rng = np.random.default_rng(0)
     image = rng.random((2, 300, 520)).astype(np.float32)
@@ -602,6 +641,34 @@ def test_a_coarser_grid_and_8_bits_on_the_command(data, tmp_path):
     assert {r["test"] for r in rows} == {"A", "F"}
 
 
+def test_thresholds_and_scrambled_pixels_on_the_command(data, tmp_path):
+    torch = pytest.importorskip("torch")
+    from catena import threshold
+    from catena import train_clarity as C
+
+    fitted = tmp_path / "threshold"
+    more = ["--windows", "2", "--size", "120", "--workers", "0", "--depth", "2"]
+    threshold.main([str(fitted), "--data", str(data), *more])
+    found = json.loads((fitted / "threshold.json").read_text())
+    assert set(found["trees"]) == {"vnir", "vis"} and sum(found["pixels"].values()) > 1000
+    runs = tmp_path / "small"
+    (runs / "seed0").mkdir(parents=True)
+    torch.manual_seed(0)
+    models = {a: C.build(a, (8, 8, 8, 8), 8) for a in ("sim", "fixed")}
+    C.save(runs / "seed0/final.pt", 1, models, {"args": {"widths": [8, 8, 8, 8], "stem": 8}})
+    args = [str(runs), "--data", str(data), "--device", "cpu", "--workers", "0", "--tests", "A"]
+    args += ["B", "--windows", "2", "--a-size", "48", "--batch", "4"]
+    E.main([*args, "--cards", "honest", E.SCRAMBLED, "--threshold", str(fitted / "threshold.json")])
+    with open(runs / "clarity_tests_AB_cards_threshold.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
+    for test in ("A", "B"):
+        models = {r["model"] for r in rows if r["test"] == test}
+        assert {"threshold", "seed0/sim", "seed0/sim@pixels scrambled"} <= models
+        assert (
+            "seed0/fixed@pixels scrambled" in models and "threshold@pixels scrambled" not in models
+        )
+
+
 def test_omnicloudmask_beside_on_landsat(data, monkeypatch):
     seen = []
 
@@ -656,3 +723,5 @@ def test_default_out(tmp_path):
     assert grid.name == "clarity_tests_DEF_grid10.csv"
     eight = E.default_out(tmp_path, list(E.TESTS), False, int8=True)
     assert eight.name == "clarity_tests_ABCDEF_int8.csv"
+    floor = E.default_out(tmp_path, list(E.TESTS), True, ["honest"], True, threshold=True)
+    assert floor.name == "clarity_tests_ABCDEF_ocm_sensei_threshold.csv"

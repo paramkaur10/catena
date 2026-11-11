@@ -3,7 +3,8 @@ test the method) on six test sets, beside OmniCloudMask wherever its predictions
 
     python -m catena.evaluate_clarity RUNS [RUNS ...] [--data /root/catena_data]
         [--tests A B C D E F] [--device cuda:0] [--windows 800] [--ocm] [--sensei] [--maps DIR]
-        [--out CSV] [--cards honest shuffled "pixel x3" ...] [--grid 10] [--int8]
+        [--out CSV] [--cards honest shuffled "pixel x3" ... "pixels scrambled"] [--grid 10]
+        [--int8] [--threshold RUNS/threshold/threshold.json]
 
 Each RUNS folder holds finished runs (final.pt) at any depth, one folder per seed, as
 scripts/big.sh makes them (runs/big/seed0, or runs/arms/chain/seed0 for OUT=runs/arms/chain);
@@ -83,8 +84,19 @@ wrong, and should hold up when bands go missing. Its rows are named <model>@<che
   rgb only          only blue, green and red kept; the fixed arm has nothing to read
   noise x3          the noise told 3 times larger where it is known (the chain arm reads it)
   blur x2           the blur told twice as wide where it is known
+and one check of the image, not the card:
+  pixels scrambled  the labelled pixels of each scene (each window of Test A) moved to random
+                    places, every band and the label alike, the prediction put back: a rule
+                    of each pixel alone (thresholds) scores the same, a network that reads the
+                    pixels around one (the shape of a cloud, the cloud that casts a shadow)
+                    loses what that told it
 Without --out, a run with checks other than honest writes clarity_tests_<tests>[_ocm]_cards.csv
 (and with SEnSeIv2, _sensei before .csv); the maps (--maps) keep the honest predictions only.
+
+Thresholds (--threshold FILE, from catena.threshold): the best rule a depth-4 tree of
+thresholds on brightness, whiteness, haze and near infrared makes, fitted on the validation
+cameras, scored on every test beside the networks (model "threshold"): the floor a network
+must clear by far to have learned more than thresholds. _threshold before .csv.
 
 A coarser working grid (--grid 10): every scene of B-F whose grid is finer than 10 m is
 predicted on a 10 m grid instead, as OmniCloudMask runs such imagery, so a 240 px tile holds
@@ -151,7 +163,8 @@ OCM = {
     "ocm4_nirblue": "OmniCloudMask, NIR from blue",
     "ocm4_nirzeros": "OmniCloudMask, NIR zeros",
 }
-BASELINES = OCM | {"sensei2": "SEnSeIv2"}  # other models, by the name of their predictions
+BASELINES = OCM | {"sensei2": "SEnSeIv2", "threshold": "Thresholds (depth-4 tree)"}
+SCRAMBLED = "pixels scrambled"  # the check of the image (the others are of the card)
 SENSEI_MODEL = "SEnSeIv2-SegFormerB2-alldata-ambiguous"
 SENSEI_CODES = np.array([0, 2, 1, 3], np.uint8)  # its clear, thick, thin, shadow in our codes
 
@@ -314,6 +327,29 @@ def checked(classify, check: str):
 def named(model: str, check: str) -> str:
     """seed0/sim under a check: seed0/sim@shuffled; honest keeps the plain name."""
     return model if check == "honest" else f"{model}@{check}"
+
+
+def scrambled(item: Item, seed: int = 0) -> tuple[Item, np.ndarray, np.ndarray]:
+    """The item with its labelled pixels moved to random places among them, every band and the
+    label alike (SCRAMBLED); and where (the labelled pixels, flat) and order, for put_back."""
+    where = np.flatnonzero(item.label.ravel() != NO_LABEL)
+    order = np.random.default_rng(seed).permutation(len(where))
+    image = item.image.reshape(len(item.image), -1).copy()
+    image[:, where] = image[:, where[order]]
+    label = item.label.ravel().copy()
+    label[where] = label[where[order]]
+    moved = replace(
+        item, image=image.reshape(item.image.shape), label=label.reshape(item.label.shape)
+    )
+    return replace(moved, others={}, coarse=None, upsample=None), where, order
+
+
+def put_back(pred: np.ndarray, where: np.ndarray, order: np.ndarray) -> np.ndarray:
+    """A prediction of a scrambled item at the places its pixels came from."""
+    flat = pred.ravel()
+    out = flat.copy()
+    out[where[order]] = flat[where]
+    return out.reshape(pred.shape)
 
 
 # --- scores ---------------------------------------------------------------------------------
@@ -776,6 +812,17 @@ def classifier(nets: dict[str, Net], device, amp: bool):
     return classify
 
 
+def tally(conf: dict, key: str, classes, y) -> None:
+    """A batch of Test A's windows added to conf[key], a 4 x 4 confusion (torch): y the labels,
+    classes the predicted, both (n, h, w)."""
+    import torch
+
+    ok = y < 4
+    if key not in conf:
+        conf[key] = torch.zeros(4, 4, dtype=torch.long, device=y.device)
+    conf[key] += torch.bincount(y[ok] * 4 + classes[ok], minlength=16).view(4, 4)
+
+
 def cameras(
     nets: dict,
     chips: Path,
@@ -786,9 +833,11 @@ def cameras(
     workers: int,
     batch: int,
     cards=("honest",),
+    rule=None,
 ):
     """Test A: {camera name: {model: 6 x 4 confusion matrix}}, one camera at a time, each
-    model under every card check (named <model>@<check>)."""
+    model under every check (named <model>@<check>); rule (catena.threshold.Rule) beside
+    them, as "threshold"."""
     import torch
     from torch.utils.data import DataLoader
 
@@ -813,23 +862,30 @@ def cameras(
         four = rgbn_slots(camera[2])
         bands = len(camera[2])  # the camera's bands fill the first slots of every window
         with torch.no_grad():
-            for b in batches:
+            for k, b in enumerate(batches):
                 x = b["image"][:, :bands].to(device, non_blocking=True)
                 told = desc.chain_card(b["d_told"][:, :bands]).to(device, non_blocking=True)
                 y = b["label"].to(device, non_blocking=True)
-                ok = y < 4
+                if rule is not None:
+                    rho = np.moveaxis(x.float().cpu().numpy(), 1, 0)
+                    guess = rule.classes(rho, told[0].float().cpu().numpy())
+                    tally(conf, "threshold", torch.from_numpy(guess).to(device).long(), y)
                 for check in cards:
-                    varied = vary(check, x, told, four)
+                    vy = y
+                    if check == SCRAMBLED:  # each window's pixels moved about, label alike
+                        order = torch.randperm(
+                            y[0].numel(), generator=torch.Generator().manual_seed(k)
+                        ).to(device)
+                        varied = (x.flatten(2)[..., order].view_as(x), told, four)
+                        vy = y.flatten(1)[:, order].view_as(y)
+                    else:
+                        varied = vary(check, x, told, four)
                     if varied is None:
                         continue
                     vx, vtold, vfour = varied
                     real = torch.ones(vx.shape[:2], dtype=torch.bool, device=device)
                     for model, logits in run_nets(nets, vx, vtold, real, vfour, amp).items():
-                        pairs = y[ok] * 4 + logits.argmax(dim=1)[ok]
-                        key = named(model, check)
-                        if key not in conf:
-                            conf[key] = torch.zeros(4, 4, dtype=torch.long, device=device)
-                        conf[key] += torch.bincount(pairs, minlength=16).view(4, 4)
+                        tally(conf, named(model, check), logits.argmax(dim=1), vy)
         found[camera[0]] = {}
         for model, m in conf.items():
             six = np.zeros((6, 4), np.int64)
@@ -914,7 +970,12 @@ def score_set(
         preds = {}
         work = item.coarse if item.coarse is not None else item
         for check in cards:
-            found = predict(checked(classify, check), work)
+            if check == SCRAMBLED:
+                moved, where, order = scrambled(work)
+                found = predict(classify, moved)
+                found = {model: put_back(p, where, order) for model, p in found.items()}
+            else:
+                found = predict(checked(classify, check), work)
             if item.coarse is not None:
                 found = {model: item.upsample(p) for model, p in found.items()}
             preds |= {named(model, check): p for model, p in found.items()}
@@ -1030,8 +1091,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--out", type=Path, help="the CSV (default: see above)")
     p.add_argument("--maps", type=Path, help="keep every scene's predictions here (.npz)")
     p.add_argument(
-        "--cards", nargs="+", default=["honest"], choices=list(CARDS), help="card checks (above)"
+        "--cards",
+        nargs="+",
+        default=["honest"],
+        choices=[*CARDS, SCRAMBLED],
+        help="checks (above)",
     )
+    p.add_argument("--threshold", type=Path, help="thresholds beside (catena.threshold's JSON)")
     p.add_argument("--grid", type=float, help="predict sets finer than this (m) on a grid of it")
     p.add_argument("--int8", action="store_true", help="each network's 8-bit twin instead of it")
     args = p.parse_args(argv)
@@ -1041,17 +1107,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def default_out(
-    runs, tests, ocm: bool, cards=("honest",), sensei: bool = False, grid=None, int8=False
+    runs,
+    tests,
+    ocm: bool,
+    cards=("honest",),
+    sensei: bool = False,
+    grid=None,
+    int8=False,
+    threshold=False,
 ) -> Path:
     """In the (last) RUNS folder: clarity_tests.csv for the six tests, plainly told,
-    clarity_tests_<tests>[_ocm][_cards][_sensei][_grid<m>][_int8].csv otherwise."""
+    clarity_tests_<tests>[_ocm][_cards][_sensei][_grid<m>][_int8][_threshold].csv otherwise."""
     folder = Path(runs if isinstance(runs, str | Path) else runs[-1])
     checks = list(cards) != ["honest"]
-    plain = not ocm and not checks and not sensei and not grid and not int8
+    plain = not ocm and not checks and not sensei and not grid and not int8 and not threshold
     if set(tests) == set(TESTS) and plain:
         return folder / "clarity_tests.csv"
     more = ("_ocm" if ocm else "") + ("_cards" if checks else "") + ("_sensei" if sensei else "")
     more += (f"_grid{grid:g}" if grid else "") + ("_int8" if int8 else "")
+    more += "_threshold" if threshold else ""
     return folder / f"clarity_tests_{''.join(sorted(tests))}{more}.csv"
 
 
@@ -1069,8 +1143,13 @@ def main(argv: list[str] | None = None) -> None:
         nets = onboard.int8_twins(nets, args.data, device, args.workers, size=args.a_size)
     tests = [t for t in TESTS if t in args.tests]
     out = args.out or default_out(
-        args.runs, tests, args.ocm, args.cards, args.sensei, args.grid, args.int8
+        args.runs, tests, args.ocm, args.cards, args.sensei, args.grid, args.int8, args.threshold
     )
+    rule = None
+    if args.threshold:
+        from catena import threshold
+
+        rule = threshold.load(args.threshold)
     print(f"{len(nets)} networks ({', '.join(nets)}) on {device}; tests {' '.join(tests)}")
     if args.cards != ["honest"]:
         print(f"card checks: {', '.join(args.cards)}", flush=True)
@@ -1096,25 +1175,29 @@ def main(argv: list[str] | None = None) -> None:
                 args.workers,
                 args.batch,
                 args.cards,
+                rule,
             )
             keep(*camera_lines(found, args.a_size))
         else:
             print(f"test A left out: no {chips / 'index.csv'}", flush=True)
     classify = classifier(nets, device, amp)
     ocm = (lambda r, g, n: omnicloudmask(r, g, n, device)) if args.ocm else None
-    extra = None
+    extras = []
     if args.sensei:
         run_sensei = sensei(device, args.sensei_batch)
+        extras.append(lambda item: {"sensei2": run_sensei(whole_scene(item), item.told)})
+    if rule is not None:
+        extras.append(lambda item: {"threshold": rule.classes(whole_scene(item), item.told)})
 
-        def extra(item: Item) -> dict:
-            return {"sensei2": run_sensei(whole_scene(item), item.told)}
+    def extra(item: Item) -> dict:
+        return {name: classes for more in extras for name, classes in more(item).items()}
 
     sets = scene_sets(args.data, [t for t in tests if t != "A"], ocm)
     if args.grid:
         sets = [on_grid(ts, args.grid) for ts in sets]
     for ts in sets:
         try:
-            keep(*score_set(ts, classify, args.maps, args.cards, extra))
+            keep(*score_set(ts, classify, args.maps, args.cards, extra if extras else None))
         except Exception:  # one broken set must not cost the others
             traceback.print_exc()
             print(f"test {ts.test}: {ts.name} stopped by the error above; the rest go on")
