@@ -82,3 +82,24 @@ def test_the_rule_as_saved(tmp_path):
     found = rule.classes(rgb, with_nir[:3])  # no near infrared: the other tree
     assert (found[0] == 0).all() and (found[1] == 1).all()
     assert (rule.classes(rho[:1], card(S2_NIR)) == 0).all()  # nothing visible: clear
+
+
+def test_the_command_picks_the_weighting_with_the_best_mean_f1(tmp_path, monkeypatch):
+    rng = np.random.default_rng(1)
+    x = rng.random((30_000, 5)).astype(np.float32)
+    y = np.zeros(len(x), np.int64)  # clear, mostly: thin, thick and shadow rarer
+    y[x[:, 0] > 0.75] = 2
+    y[(x[:, 0] > 0.6) & (x[:, 0] <= 0.75)] = 1
+    y[(x[:, 0] < 0.08) & (x[:, 3] < 0.5)] = 3
+    noise = rng.random(len(x)) < 0.1
+    y[noise] = rng.integers(0, 4, noise.sum())
+    monkeypatch.setattr(T, "samples", lambda *args: (x, y))
+    T.main([str(tmp_path), "--depth", "3"])
+    found = json.loads((tmp_path / "threshold.json").read_text())
+    assert set(found["trees"]) == {"vnir", "vis"} and set(found["power"]) == {"vnir", "vis"}
+    for name in ("vnir", "vis"):
+        tried = {p: found["mean_f1_tried"][f"{name} {p:g}"] for p in T.POWERS}
+        assert found["power"][name] in T.POWERS
+        assert tried[found["power"][name]] == max(tried.values())
+    rule = T.load(tmp_path / "threshold.json")
+    assert rule.trees == found["trees"]

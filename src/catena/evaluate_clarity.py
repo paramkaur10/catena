@@ -65,10 +65,11 @@ Writes --out (default RUNS/clarity_tests.csv), again after every set: one row pe
 scene (and per set the pooled scores, scene "all"), model and size, with the confusion matrix
 (6 x 4: rows the label codes 0 clear, 1 thin, 2 thick, 3 shadow, 4 cloud, 5 not cloud; columns
 the predicted class clear, thin, thick, shadow) and the scores. Prints per set the mean and the
-standard deviation over the seeds of each version, and OmniCloudMask. A set that fails is
-reported and skipped. Without --out, the CSV goes to the last RUNS folder: clarity_tests.csv
-for all six tests and clarity_tests_<tests>[_ocm].csv otherwise, so a partial run never
-overwrites the full one.
+standard deviation over the seeds of each version, and OmniCloudMask. A baseline that fails on
+a scene (SEnSeIv2 out of memory, say) is left out of that scene only, said in the log; a set
+that fails is reported and skipped. Without --out, the CSV goes to the last RUNS folder:
+clarity_tests.csv for all six tests and clarity_tests_<tests>[_ocm].csv otherwise, so a partial
+run never overwrites the full one.
 --maps DIR keeps every scene's predictions, label, OmniCloudMask's classes and true colour,
 one .npz per scene, for pictures (catena.maps, notebooks/results_<dataset>.ipynb).
 
@@ -117,6 +118,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import sys
 import time
 import traceback
 from collections.abc import Callable, Iterator
@@ -417,6 +419,19 @@ def found_drafts(folder: Path, names: tuple[str, ...]) -> dict[str, np.ndarray]:
     return {n: codes(folder / f"{n}.tif") for n in names if (folder / f"{n}.tif").exists()}
 
 
+def beside(name: str, run, item) -> np.ndarray | None:
+    """A baseline's classes of a scene, run(item); None, said in the log, if it fails there
+    (out of memory, say): the scene is scored without it, the networks and the other
+    baselines as ever."""
+    try:
+        return run(item)
+    except Exception as e:  # whatever it is, the networks' scores go on
+        print(f"  {item.name}: {name} left out of this scene: {type(e).__name__}: {e}", flush=True)
+        if "torch" in sys.modules and sys.modules["torch"].cuda.is_available():
+            sys.modules["torch"].cuda.empty_cache()
+        return None
+
+
 def with_drafts(label: np.ndarray, drafts: dict) -> np.ndarray:
     """The label without the pixels a draft has no prediction for, so every model is scored
     on the same pixels."""
@@ -583,8 +598,12 @@ def landsat_set(test: str, module, root: Path, title: str, ocm=None) -> SceneSet
             label = np.where(dn.all(axis=0), label, NO_LABEL).astype(np.uint8)
             others = {}
             if ocm is not None:
-                others["ocm4"] = ocm(*some_bands(module, scene, dn, rgn))
-                label = with_drafts(label, others)
+                found = beside(
+                    "OmniCloudMask", lambda s, dn=dn: ocm(*some_bands(module, s, dn, rgn)), scene
+                )
+                if found is not None:
+                    others["ocm4"] = found
+                    label = with_drafts(label, others)
             yield Item(
                 scene.name,
                 dn,
@@ -1182,15 +1201,19 @@ def main(argv: list[str] | None = None) -> None:
             print(f"test A left out: no {chips / 'index.csv'}", flush=True)
     classify = classifier(nets, device, amp)
     ocm = (lambda r, g, n: omnicloudmask(r, g, n, device)) if args.ocm else None
-    extras = []
+    extras = {}
     if args.sensei:
         run_sensei = sensei(device, args.sensei_batch)
-        extras.append(lambda item: {"sensei2": run_sensei(whole_scene(item), item.told)})
+        extras["sensei2"] = lambda item: run_sensei(whole_scene(item), item.told)
     if rule is not None:
-        extras.append(lambda item: {"threshold": rule.classes(whole_scene(item), item.told)})
+        extras["threshold"] = lambda item: rule.classes(whole_scene(item), item.told)
 
     def extra(item: Item) -> dict:
-        return {name: classes for more in extras for name, classes in more(item).items()}
+        return {
+            name: classes
+            for name, more in extras.items()
+            if (classes := beside(name, more, item)) is not None
+        }
 
     sets = scene_sets(args.data, [t for t in tests if t != "A"], ocm)
     if args.grid:

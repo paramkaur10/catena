@@ -669,6 +669,34 @@ def test_thresholds_and_scrambled_pixels_on_the_command(data, tmp_path):
         )
 
 
+def test_a_baseline_that_fails_on_a_scene_costs_only_itself(data, capsys):
+    heo = next(s for s in E.scene_sets(data, ["D"]) if s.name == "heo_test")
+    seen = []
+
+    def run(item):
+        seen.append(item.name)
+        if len(seen) == 1:
+            raise MemoryError("out of memory")
+        return np.zeros(item.label.shape, np.uint8)
+
+    rows, _ = E.score_set(
+        heo,
+        pixelwise,
+        extra=lambda item: {"x": c} if (c := E.beside("x", run, item)) is not None else {},
+    )
+    assert "x left out of this scene: MemoryError" in capsys.readouterr().out
+    scenes = {r["scene"] for r in rows if r["model"] == "m"} - {"all"}
+    beside = {r["scene"] for r in rows if r["model"] == "x"} - {"all"}
+    assert len(scenes) == len(seen) > 1 and beside == scenes - {seen[0]}
+
+    def broken(red, green, nir):
+        raise RuntimeError("CUDA out of memory")
+
+    landsat8 = E.scene_sets(data, ["B"], broken)[0]
+    first = next(landsat8.items())  # OmniCloudMask failed: the scene, without it
+    assert first.others == {} and (first.label != 255).any()
+
+
 def test_omnicloudmask_beside_on_landsat(data, monkeypatch):
     seen = []
 

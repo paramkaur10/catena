@@ -13,10 +13,12 @@ visible bands has them, whatever its bands:
               (Fmask's haze optimised transform)
   nir         the mean reflectance of the near infrared bands (760-1000 nm)
   ndvi        (nir - red) / (nir + red)
-The rule is a decision tree of depth 4 (at most 15 thresholds), grown by Gini impurity with
-each class weighted by the inverse of its share of the pixels (so clear, the most common, does
-not win every leaf), on PER_WINDOW pixels of each window of the CloudSEN12+ validation split
-as the six validation cameras see it (catena.train.ValSamples: never test data). A camera
+The rule is a decision tree of depth 4 (at most 15 thresholds), grown by Gini impurity on
+PER_WINDOW pixels of each window of the CloudSEN12+ validation split as the six validation
+cameras see it (catena.train.ValSamples: never test data), each class weighted by its share
+of the pixels to the power -p: p 0 (clear, the most common, wins most leaves), 1/2 or 1 (every
+class as heavy as the others), whichever gives the best mean F1 on those pixels, the score the
+tables report. A camera
 without near infrared gets a second tree, grown on the first three features of the same
 pixels. Per pixel, so moving the pixels about changes nothing (evaluate_clarity's "pixels
 scrambled" check).
@@ -48,6 +50,7 @@ PER_WINDOW = 4000
 BINS = 64  # candidate thresholds per feature: its quantiles
 MIN_LEAF = 200  # pixels at least on each side of a threshold
 SIZE = 240  # the validation windows, in 10 m pixels, as the search and training validate
+POWERS = (0.0, 0.5, 1.0)  # class weightings tried: share to the power -p
 
 
 def wavelengths(told: np.ndarray) -> np.ndarray:
@@ -88,12 +91,20 @@ def features(rho: np.ndarray, r: dict) -> np.ndarray:
 # --- the tree -------------------------------------------------------------------------------
 
 
-def grow(x: np.ndarray, y: np.ndarray, depth: int, bins: int = BINS, least: int = MIN_LEAF):
+def grow(
+    x: np.ndarray,
+    y: np.ndarray,
+    depth: int,
+    bins: int = BINS,
+    least: int = MIN_LEAF,
+    power: float = 1.0,
+):
     """A decision tree on x (n, features) for the classes y (n,) 0-3: Gini impurity, each class
-    weighted by the inverse of its share; thresholds among each feature's quantiles. A list of
-    nodes, the root first: {"feature", "threshold", "left", "right"} or {"class"}."""
+    weighted by its share of the pixels to the power -power (0: as they come; 1: every class
+    as heavy as the others); thresholds among each feature's quantiles. A list of nodes, the
+    root first: {"feature", "threshold", "left", "right"} or {"class"}."""
     counts = np.bincount(y, minlength=len(CLASSES)).astype(np.float64)
-    weight = np.where(counts > 0, counts.sum() / np.maximum(counts, 1), 0.0)[y]
+    weight = np.where(counts > 0, (counts.sum() / np.maximum(counts, 1)) ** power, 0.0)[y]
     edges = [
         np.unique(np.quantile(x[:, j], np.linspace(0, 1, bins + 1)[1:-1]))
         for j in range(x.shape[1])
@@ -256,13 +267,17 @@ def samples(data: Path, windows: int, size: int, workers: int, seed: int = 0):
     return np.concatenate(xs), np.concatenate(ys)
 
 
-def scored(tree: list[dict], x: np.ndarray, y: np.ndarray) -> str:
-    """The F1 of each class and their mean, on the pixels grown on."""
+def f1s(tree: list[dict], x: np.ndarray, y: np.ndarray) -> list[float]:
+    """The F1 of each class on pixels x (n, features) of classes y."""
     pred = decide(tree, x.T)
-    f1 = []
+    out = []
     for c in range(len(CLASSES)):
         tp, both = np.sum((pred == c) & (y == c)), np.sum(pred == c) + np.sum(y == c)
-        f1.append(2 * tp / both if both else np.nan)
+        out.append(2 * tp / both if both else np.nan)
+    return out
+
+
+def scored(f1: list[float]) -> str:
     parts = [f"F1 {n} {v:.3f}" for n, v in zip(CLASSES, f1, strict=True)]
     return ", ".join(parts) + f"; mean {np.nanmean(f1):.3f}"
 
@@ -283,12 +298,22 @@ def main(argv: list[str] | None = None) -> None:
         f"{len(y):,} pixels: "
         + ", ".join(f"{n} {c:,}" for n, c in zip(CLASSES, counts, strict=True))
     )
-    trees = {"vnir": grow(x, y, args.depth), "vis": grow(x[:, :VISIBLE_ONLY], y, args.depth)}
-    for name, tree in trees.items():
-        cols = x if name == "vnir" else x[:, :VISIBLE_ONLY]
-        print(f"\n{name} ({scored(tree, cols, y)}):\n" + "\n".join(lines(tree)))
+    trees, powers, tried = {}, {}, {}
+    for name, cols in (("vnir", x), ("vis", x[:, :VISIBLE_ONLY])):
+        best = None
+        for power in POWERS:  # the weighting with the best mean F1, the tables' score
+            tree = grow(cols, y, args.depth, power=power)
+            f1 = f1s(tree, cols, y)
+            tried[f"{name} {power:g}"] = round(float(np.nanmean(f1)), 4)
+            print(f"{name}, classes weighted by share^-{power:g}: {scored(f1)}")
+            if best is None or np.nanmean(f1) > np.nanmean(best[2]):
+                best = (power, tree, f1)
+        powers[name], trees[name] = best[0], best[1]
+        print(f"\n{name}, share^-{best[0]:g} ({scored(best[2])}):\n" + "\n".join(lines(best[1])))
+        print()
     args.out.mkdir(parents=True, exist_ok=True)
     found = {"features": FEATURES, "classes": CLASSES, "depth": args.depth, "trees": trees}
+    found |= {"power": powers, "mean_f1_tried": tried}
     found |= {"fitted_on": {"windows_per_camera": args.windows, "size": args.size}}
     found |= {"pixels": {n: int(c) for n, c in zip(CLASSES, counts, strict=True)}}
     (args.out / "threshold.json").write_text(json.dumps(found, indent=1) + "\n")
