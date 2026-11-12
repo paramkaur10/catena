@@ -36,6 +36,15 @@ read:
           order), trained end to end like the others; it reads the card.
 With the same seed every arm sees what the first big run's sim version saw: what an arm adds
 (its four bands, dropout and errors) is drawn from random streams of its own.
+Three arms learn from real's samples instead, with no made-up camera at all:
+  chain_real   the chain card of each sample as delivered: the MTF and the SNR only where a
+               product's documents state them (Sentinel-2's spec, Landsat 8's noise), never a
+               made-up value, with chain's dropout and errors. Beside real, on the same
+               samples: what telling the measured MTF and SNR alone is worth;
+  sensei_real  sensei's four numbers;
+  blind_real   nothing.
+A run with no batch from HEO (--shares 0.5 0.25 0 0.25) leaves HEO as a satellite never
+seen, beside IRIDE Eaglet II, Phi-sat-2 and Landsat 7.
 
 So real and sim differ only in the made-up cameras. Two options change sim's samples only:
   --q-weights  how often its Sentinel-2 samples get 10, 30 and 50 m pixels (default 1 1 1:
@@ -140,6 +149,9 @@ ARMS = {
     "fixed": Arm("sim", 0),
     "nas": Arm("sim", desc.N_CARD),
     "nas2": Arm("sim", desc.N_CARD),
+    "sensei_real": Arm("real", 4),  # the three that never see a made-up camera
+    "chain_real": Arm("real", desc.N_CHAIN_CARD),
+    "blind_real": Arm("real", desc.N_CARD, blind=True),
 }
 NAS = ("nas", "nas2")  # the arms whose trunk is an architecture code
 
@@ -185,11 +197,14 @@ class Samples(Dataset):
     (told), band slots and label; the sim version's image, chain card (sim_told, with
     descriptor dropout and errors, which touch only its MTF and SNR numbers) and label; and,
     with fixed, the fixed arm's blue, green, red and near infrared (fixed_image) on the sim
-    version's grid. same is True when the sim version sees what the real one sees (every
-    batch but Sentinel-2's, unless the sim version gets faults); its own image and label are
-    then small placeholders. The real version's samples do not depend on q_weights, faults,
-    fixed or chain_jitter, and the sim version's images not on fixed or chain_jitter: they
-    are drawn first, and the rest from random streams of its own."""
+    version's grid. hid_told is the real version's chain card with the same dropout and
+    errors, for the arms that read the MTF and the SNR of samples as delivered (chain_real):
+    sim_told itself wherever the sim version sees what the real one sees. same is True when
+    the sim version sees what the real one sees (every batch but Sentinel-2's, unless the sim
+    version gets faults); its own image and label are then small placeholders. The real
+    version's samples do not depend on q_weights, faults, fixed or chain_jitter, and the sim
+    version's images not on fixed or chain_jitter: they are drawn first, and the rest from
+    random streams of its own."""
 
     def __init__(
         self,
@@ -376,8 +391,12 @@ class Samples(Dataset):
         drop = np.random.default_rng([self.seed, 4, i])  # the chain arm's dropout and errors
         hidden = out.pop("sim_desc").copy()
         hidden[:n] = desc.jitter(desc.hide(hidden[:n], drop), drop, self.chain_jitter)
+        again = np.random.default_rng([self.seed, 4, i])  # the same draws, for the real version
+        shown = out["desc"].copy()
+        shown[:n] = desc.jitter(desc.hide(shown[:n], again), again, self.chain_jitter)
         out["told"] = desc.chain_card(out.pop("desc"))
         out["sim_told"] = desc.chain_card(hidden)
+        out["hid_told"] = desc.chain_card(shown)
         return out | {"source": SOURCES.index(source)}
 
 
@@ -390,7 +409,12 @@ def arm_inputs(batch: dict, name: str) -> tuple:
     if arm.fields == 0:
         return batch["fixed_image"], None, None, label
     image = batch["sim_image"] if own else batch["image"]
-    told = batch["sim_told"] if arm.data == "sim" else batch["told"]
+    if arm.data == "sim":
+        told = batch["sim_told"]
+    elif arm.fields > desc.N_CARD:  # the MTF and the SNR of samples as delivered: with dropout
+        told = batch["hid_told"]
+    else:
+        told = batch["told"]
     if arm.blind:
         told = torch.zeros_like(told)
     return image, told, batch["real"], label
@@ -751,7 +775,7 @@ def main(argv: list[str] | None = None) -> None:
         net = f"band encoder and PyNAS trunk {trunks[a]}" if a in trunks else net
         net += ", told nothing" if ARMS[a].blind else ""
         print(
-            f"  {a:<7}{net}; {ARMS[a].data}'s samples; {n:,} parameters, "
+            f"  {a:<12}{net}; {ARMS[a].data}'s samples; {n:,} parameters, "
             f"{2 * n / 1e6:.1f} MB at float16; on {devices[a]}",
             flush=True,
         )
@@ -762,11 +786,15 @@ def main(argv: list[str] | None = None) -> None:
             f"{r['share']:>7.0%}  {r['labels']}"
         )
     pixel = "/".join(f"{w:.0%}" for w in weights_q)
-    print(
-        f"  made-up cameras: sim only, {config['made_up_cameras']['share_of_sentinel2']:.0%} of "
-        f"the Sentinel-2 samples (pixels 10/30/50 m: {pixel}), saturation {TOPS[0]}-{TOPS[1]}",
-        flush=True,
-    )
+    if any(ARMS[a].data == "sim" for a in arms):
+        share = config["made_up_cameras"]["share_of_sentinel2"]
+        print(
+            f"  made-up cameras: sim only, {share:.0%} of the Sentinel-2 samples "
+            f"(pixels 10/30/50 m: {pixel}), saturation {TOPS[0]}-{TOPS[1]}",
+            flush=True,
+        )
+    else:
+        print("  made-up cameras: none, both arms learn from the samples as delivered", flush=True)
     if args.faults > 0:
         print(
             f"  calibration faults: sim only, {args.faults:.0%} of every satellite's samples: "
@@ -834,7 +862,7 @@ def main(argv: list[str] | None = None) -> None:
                 entry = {"kind": "val", "step": step, "version": a, "camera": "mean"}
                 log.write(json.dumps(entry | mean) + "\n")
                 print(
-                    f"   validation {a:<6}  F1 clear {mean['f1_clear']:.3f} thin "
+                    f"   validation {a:<11}  F1 clear {mean['f1_clear']:.3f} thin "
                     f"{mean['f1_thin']:.3f} thick {mean['f1_thick']:.3f} shadow "
                     f"{mean['f1_shadow']:.3f}  cloud BA {mean['cloud_ba']:.3f}",
                     flush=True,

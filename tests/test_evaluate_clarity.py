@@ -403,6 +403,40 @@ def test_card_checks():
         E.vary("lies", x, told, rgbn)
 
 
+def test_binned_windows():
+    told = np.zeros((2, 3, desc.N_CHAIN_CARD), np.float32)  # two windows, three bands
+    told[..., E.SAMPLING_AT] = [0, 1, np.log2(6)]  # bands of 10, 20 and 60 m on a 10 m grid
+    told[..., E.PSF_AT] = [0.6, 0, 1.2]  # the second band's blur is not known
+    told[..., E.KNOWN_PSF_AT] = [1, 0, 1]
+    told[..., E.NOISE_AT[0]], told[..., E.NOISE_AT[1]] = [1.0, 0, 0.5], [1.5, 0, 0.8]
+    told[..., E.KNOWN_NOISE_AT] = [1, 0, 1]  # nor its noise
+    before = told.copy()
+    x = np.arange(2 * 3 * 48 * 48, dtype=np.float32).reshape(2, 3, 48, 48)
+    small, coarse, four = E.binned("binned x3", x, told, (0, 1, 2, 2))
+    assert small.shape == (2, 3, 16, 16) and four == (0, 1, 2, 2)
+    assert small[1, 2, 5, 7] == pytest.approx(x[1, 2, 15:18, 21:24].mean())  # 3 x 3 averaged
+    assert coarse[..., E.GSD_AT] == pytest.approx(np.log2(3))  # told the pixel it now has
+    assert coarse[0, :, E.SAMPLING_AT] == pytest.approx([0, 0, 1])  # 60 m on a 30 m grid
+    assert coarse[0, :, E.PSF_AT] == pytest.approx([0.2, 0, 0.4])
+    for at, was in zip(E.NOISE_AT, ([1.0, 0, 0.5], [1.5, 0, 0.8]), strict=True):
+        lower = [was[0] - np.log10(3), 0, was[2] - np.log10(3)]  # 9 pixels: a third the noise
+        assert coarse[1, :, at] == pytest.approx(lower)
+    assert np.array_equal(coarse[..., :4], told[..., :4])
+    assert np.array_equal(coarse[..., E.KNOWN_PSF_AT :], told[..., E.KNOWN_PSF_AT :])
+    assert np.array_equal(told, before)  # a copy
+    assert E.binned("binned x2", x, told, None)[0].shape == (2, 3, 24, 24)
+    wide = np.zeros((2, 3, 80, 80), np.float32)
+    assert E.binned("binned x3", wide, told, None) is None  # 80 px: not by 3
+    assert E.binned("binned x2", wide, told, None)[0].shape == (2, 3, 40, 40)
+    assert E.binned("binned x2", x[..., :40, :40], told, None) is None  # 20 px: not by 8
+    classes = np.arange(2 * 4 * 4).reshape(2, 4, 4)
+    back = E.spread(classes, 3)
+    assert back.shape == (2, 12, 12) and (back[1, 3:6, 9:12] == classes[1, 1, 3]).all()
+    assert E.group_of(E.named("seed0/nas", "binned x3")) == "PyNAS trunk 1 [binned x3]"
+    assert E.group_of("seed1/chain_real") == "Clarity real + MTF, SNR"
+    assert set(E.BINNED) == {"binned x2", "binned x3"} and not set(E.BINNED) & set(E.CARDS)
+
+
 def test_what_sensei_is_told():
     told = np.zeros((2, desc.N_CHAIN_CARD), np.float32)
     told[:, [0, 2]] = [[desc.wavelength_code(645.5), desc.wavelength_code(684.5)]] * 2
@@ -615,6 +649,24 @@ def test_card_checks_on_the_command(data, tmp_path):
         assert "seed0/fixed@rgbn only" in models and "seed0/fixed@rgb only" not in models
     a = {r["scene"] for r in rows if r["model"] == "seed0/sim@rgb only"}
     assert len(a & {"sentinel2", "rgbn_10m_mtf0.3_snr150"}) == 2  # every camera, too
+    out = tmp_path / "binned.csv"
+    args = [str(runs), "--data", str(data), "--device", "cpu", "--workers", "0", "--tests", "A"]
+    args += ["F", "--windows", "2", "--a-size", "96", "--batch", "4", "--out", str(out)]
+    E.main([*args, "--cards", "honest", "binned x2", "binned x3"])
+    with open(out, newline="") as f:
+        rows = list(csv.DictReader(f))
+    scenes = {r["model"] for r in rows if r["test"] == "F"}  # the scenes: no binned check
+    assert "seed0/sim" in scenes and not any("binned" in m for m in scenes)
+    by = {m: [r for r in rows if r["model"] == m and r["test"] == "A"] for m in ("seed0/sim",)}
+    by |= {c: [r for r in rows if r["model"] == f"seed0/sim@{c}"] for c in E.BINNED}
+    assert len(by["seed0/sim"]) == len(by["binned x2"]) == 23  # 96 and 32 px halve
+    thirds = {r["scene"] for r in by["binned x3"]}  # 32 px at 30 m: not by 3
+    assert "sentinel2" in thirds and "rgbn_10m_mtf0.3_snr150" in thirds
+    assert not any("_30m_" in scene for scene in thirds) and len(thirds) < 23
+    honest = {r["scene"]: int(r["pixels"]) for r in by["seed0/sim"]}
+    for r in by["binned x2"] + by["binned x3"]:
+        assert int(r["pixels"]) == honest[r["scene"]]  # scored on the camera's own pixels
+    assert any(r["model"] == "seed0/fixed@binned x2" for r in rows)
 
 
 def test_a_coarser_grid_and_8_bits_on_the_command(data, tmp_path):

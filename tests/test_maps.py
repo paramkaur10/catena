@@ -70,3 +70,10 @@ def test_every_arm_has_its_title(tmp_path):
     arrays |= {"seed0_fixed": arrays["seed0_sim"], "seed0_chain": arrays["seed0_real"]}
     names = list(kept.models(arrays))
     assert names[:4] == ["Clarity real", "Clarity sim", "Clarity + MTF, SNR", "U-Net fixed bands"]
+    real = arrays["seed0_real"]
+    other = (real + 1) % 4  # another class everywhere
+    apart = {"seed0_real": real, "seed0_chain_real": other, "seed1_chain_real": other}
+    found = kept.models(apart)  # an arm on real's samples is not one of real's seeds
+    assert list(found) == ["Clarity real", "Clarity real + MTF, SNR"]
+    assert np.array_equal(found["Clarity real"], real)
+    assert np.array_equal(found["Clarity real + MTF, SNR"], other)

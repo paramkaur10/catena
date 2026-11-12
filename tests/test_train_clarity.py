@@ -287,12 +287,69 @@ def test_what_the_arms_add_is_drawn_apart(data):
         samples(data, fixed=True, faults=0.5)
 
 
+def test_the_mtf_and_snr_of_samples_as_delivered(data):
+    s = samples(data, shares=QUARTERS, chain_jitter=0.0)
+    hidden = kept = 0
+    for i in range(240):
+        x = s[i]
+        n = int(x["real"].sum())
+        told, hid, sim_told = x["told"], x["hid_told"], x["sim_told"]
+        assert hid.shape == (13, 11) and hid.dtype == told.dtype and (hid[n:] == 0).all()
+        assert np.array_equal(hid[:, :6], told[:, :6])  # dropout never touches the card
+        if x["same"]:
+            assert np.array_equal(hid, sim_told)  # one dropout for chain and chain_real
+        if C.SOURCES[x["source"]] != "sentinel2":
+            continue
+        assert (told[:n, 10] == 1).all()  # Sentinel-2's noise is in its spec
+        gone = bool((hid[:n, 10] == 0).all())
+        assert gone == bool((sim_told[:n, 10] == 0).all())  # hidden for both or for neither
+        hidden += gone
+        kept += int(np.array_equal(hid[:n, 7:9], told[:n, 7:9]) and (hid[:n, 10] == 1).all())
+        assert gone or np.array_equal(hid[:n, 7:9], told[:n, 7:9])  # never a made-up value
+        assert set(np.unique(hid[:n, 6]).tolist()) <= set(np.unique(told[:n, 6]).tolist()) | {0.0}
+    assert hidden > 0 and kept > 0
+    moved = samples(data, shares=QUARTERS, chain_jitter=1.0)
+    changed = 0
+    for i in range(240):
+        a, b = s[i], moved[i]
+        assert np.array_equal(a["hid_told"][:, :6], b["hid_told"][:, :6])  # never the card
+        assert np.array_equal(a["told"], b["told"])  # nor what the card arms read
+        changed += int(not np.array_equal(a["hid_told"], b["hid_told"]))
+    assert changed > 0  # errors move the known MTF and SNR
+
+
+def test_what_the_arms_of_real_samples_see(data):
+    s = samples(data, shares=QUARTERS)
+    parted = 0
+    for i in range(0, 240, 4):
+        items = [s[i + k] for k in range(4)]  # one batch
+        batch = {key: np.stack([x[key] for x in items]) for key in items[0]}
+        image, told, real, label = C.arm_inputs(batch, "chain_real")
+        assert image is batch["image"] and told is batch["hid_told"]  # as delivered, dropout
+        assert real is batch["real"] and label is batch["label"]
+        for arm in ("real", "sensei_real"):  # the card: nothing to hide
+            seen = C.arm_inputs(batch, arm)
+            assert seen[0] is batch["image"] and seen[1] is batch["told"]
+            assert seen[3] is batch["label"]
+        own = C.arm_inputs(batch, "chain")
+        assert own[1] is batch["sim_told"]
+        assert (own[0] is batch["image"]) == bool(batch["same"][0])
+        parted += int(own[0] is not batch["image"])
+    assert parted > 0  # chain learns from the made-up cameras, chain_real never
+
+
 def test_the_arms():
-    assert set(C.ARMS) == {"real", "sim", "sensei", "chain", "blind", "fixed", "nas", "nas2"}
+    made_up = {"sim", "sensei", "chain", "blind", "fixed", "nas", "nas2"}
+    delivered = {"real", "sensei_real", "chain_real", "blind_real"}  # never a made-up camera
+    assert set(C.ARMS) == made_up | delivered
     assert C.NAS == ("nas", "nas2") and C.codes_of(["nas", "sim"], ["L"]) == {"nas": "L"}
     assert C.ARMS["sensei"].fields == 4 and C.ARMS["chain"].fields == 11  # their first numbers
     assert C.ARMS["fixed"].fields == 0 and C.ARMS["blind"].blind
-    assert all(a.data == "sim" for k, a in C.ARMS.items() if k != "real")
+    assert all(C.ARMS[k].data == "sim" for k in made_up)
+    assert all(C.ARMS[k].data == "real" for k in delivered)
+    for k in ("sensei", "chain", "blind"):  # each reads what its twin reads
+        twin = C.ARMS[f"{k}_real"]
+        assert (twin.fields, twin.blind) == (C.ARMS[k].fields, C.ARMS[k].blind)
     assert C.rgbn_slots(loader.BANDS) == [1, 2, 3, 7]
     assert C.rgbn_slots(("B01", "B02", "B03", "B04", "B8A", "B10", "B11", "B12")) == [1, 2, 3, 4]
     for bad in (["--arms", "sim", "sim"], ["--arms", "fixed", "sim", "--faults", "0.2"]):
@@ -376,6 +433,27 @@ def test_short_runs_of_the_arms(data, tmp_path):
     assert state["models"]["sensei"]["bands.embed.0.weight"].shape[1] == 4
     assert state["models"]["blind"]["bands.embed.0.weight"].shape[1] == 6
     assert state["arms"]["blind"]["blind"]
+
+
+def test_short_runs_as_delivered_without_heo(data, tmp_path):
+    no_heo = ("--shares", "0.5", "0.25", "0", "0.25")
+    C.main(run_args(data, tmp_path / "run", "--arms", "real", "chain_real", *no_heo))
+    state = torch.load(tmp_path / "run/final.pt", map_location="cpu")
+    assert set(state["models"]) == {"real", "chain_real"} and state["step"] == 4
+    assert state["arms"]["chain_real"] == {"data": "real", "fields": 11, "blind": False}
+    assert state["models"]["chain_real"]["bands.embed.0.weight"].shape[1] == 11
+    assert state["models"]["real"]["bands.embed.0.weight"].shape[1] == 6
+    config = json.loads((tmp_path / "run/config.json").read_text())
+    assert [r["source"] for r in config["sources"]] == ["sentinel2", "landsat8", "perusat1"]
+    assert config["heo_scenes"] == [] and config["args"]["shares"] == [0.5, 0.25, 0.0, 0.25]
+    entries = [json.loads(x) for x in (tmp_path / "run/metrics.jsonl").read_text().splitlines()]
+    assert {e["version"] for e in entries if e["kind"] == "val"} == {"real", "chain_real"}
+    seen = [e["batches"] for e in entries if e["kind"] == "train"]
+    assert all("heo" not in b for b in seen)
+    C.main(run_args(data, tmp_path / "told", "--arms", "sensei_real", "blind_real", *no_heo))
+    state = torch.load(tmp_path / "told/final.pt", map_location="cpu")
+    assert state["models"]["sensei_real"]["bands.embed.0.weight"].shape[1] == 4
+    assert state["arms"]["blind_real"] == {"data": "real", "fields": 6, "blind": True}
 
 
 def test_the_versions_part_on_sentinel2(data, tmp_path):

@@ -3,7 +3,8 @@ test the method) on six test sets, beside OmniCloudMask wherever its predictions
 
     python -m catena.evaluate_clarity RUNS [RUNS ...] [--data /root/catena_data]
         [--tests A B C D E F] [--device cuda:0] [--windows 800] [--ocm] [--sensei] [--maps DIR]
-        [--out CSV] [--cards honest shuffled "pixel x3" ... "pixels scrambled"] [--grid 10]
+        [--out CSV] [--cards honest shuffled "pixel x3" ... "pixels scrambled" "binned x3"]
+        [--grid 10]
         [--int8] [--threshold RUNS/threshold/threshold.json]
 
 Each RUNS folder holds finished runs (final.pt) at any depth, one folder per seed, as
@@ -91,6 +92,15 @@ and one check of the image, not the card:
                     of each pixel alone (thresholds) scores the same, a network that reads the
                     pixels around one (the shape of a cloud, the cloud that casts a shadow)
                     loses what that told it
+and two that act on what a card says, on Test A's windows only:
+  binned x2         each window's pixels averaged 2 x 2 before the network, as a camera with
+  binned x3         pixels 2 (3) times larger delivers it: the noise falls 2 (3) times, the
+                    cards are told the coarser pixel (as --grid tells them), and the classes
+                    go back onto the camera's own pixels (nearest), so the same pixels are
+                    scored. A camera too noisy for the network at its own pixel size can be
+                    read at a coarser one: what its SNR is worth when it is acted on. Left
+                    out where a window does not divide (80 px at 30 m by 3); for the scenes
+                    of B-F a coarser grid is --grid.
 Without --out, a run with checks other than honest writes clarity_tests_<tests>[_ocm]_cards.csv
 (and with SEnSeIv2, _sensei before .csv); the maps (--maps) keep the honest predictions only.
 
@@ -136,6 +146,7 @@ from catena.sensors import spec
 
 VERSIONS = ("real", "sim")  # the first big run's arms
 ARMS = ("real", "sim", "sensei", "chain", "blind", "fixed", "nas", "nas2")  # the tables' order
+ARMS += ("sensei_real", "chain_real", "blind_real")  # no made-up camera in training
 ARM_TITLES = {
     "real": "Clarity real",
     "sim": "Clarity sim",
@@ -145,6 +156,9 @@ ARM_TITLES = {
     "fixed": "U-Net fixed bands",
     "nas": "PyNAS trunk 1",
     "nas2": "PyNAS trunk 2",
+    "sensei_real": "Clarity real, no pixel size",
+    "chain_real": "Clarity real + MTF, SNR",
+    "blind_real": "Clarity real, told nothing",
 }
 TESTS = ("A", "B", "C", "D", "E", "F")
 NO_LABEL = 255
@@ -167,6 +181,7 @@ OCM = {
 }
 BASELINES = OCM | {"sensei2": "SEnSeIv2", "threshold": "Thresholds (depth-4 tree)"}
 SCRAMBLED = "pixels scrambled"  # the check of the image (the others are of the card)
+BINNED = {"binned x2": 2, "binned x3": 3}  # Test A: k x k pixels averaged before the network
 SENSEI_MODEL = "SEnSeIv2-SegFormerB2-alldata-ambiguous"
 SENSEI_CODES = np.array([0, 2, 1, 3], np.uint8)  # its clear, thick, thin, shadow in our codes
 
@@ -314,6 +329,42 @@ def vary(check: str, x, told, rgbn):
     else:  # blur x2: an unknown blur (0) stays 0
         told[..., PSF_AT] *= 2
     return x, told, rgbn
+
+
+def told_coarser(told, f: float):
+    """Chain cards (..., bands, 11) of the same bands averaged into pixels f times larger, as
+    coarser() tells a coarser grid: the grid's pixel f times larger, a band's own pixel against
+    it smaller (never below the grid's), a known blur f times narrower in the new pixels, a
+    known noise f times lower (f x f pixels averaged). A copy; numpy arrays or torch tensors."""
+    told = _copied(told)
+    told[..., GSD_AT] += math.log2(f)
+    told[..., SAMPLING_AT] = (told[..., SAMPLING_AT] - math.log2(f)).clip(min=0)
+    told[..., PSF_AT] /= f  # an unknown blur (0) stays 0
+    known = told[..., KNOWN_NOISE_AT : KNOWN_NOISE_AT + 1]
+    told[..., NOISE_AT[0] : NOISE_AT[1] + 1] -= math.log10(f) * known
+    return told
+
+
+def binned(check: str, x, told, rgbn, multiple: int = 8):
+    """A batch as a camera with pixels k times larger delivers it (BINNED): x (n, bands, h, w)
+    averaged over k x k pixels, so its noise falls k times, and its cards told the coarser
+    pixel (told_coarser). Numpy arrays or torch tensors; the result (x, told, rgbn), or None
+    where the window does not divide into k x k pixels and then by `multiple` (the networks
+    halve an image three times)."""
+    k = BINNED[check]
+    h, w = x.shape[-2:]
+    if h % k or w % k or (h // k) % multiple or (w // k) % multiple:
+        return None
+    small = x.reshape(*x.shape[:-2], h // k, k, w // k, k).mean((-3, -1))
+    return small, told_coarser(told, k), rgbn
+
+
+def spread(classes, k: int):
+    """Classes (..., h, w) predicted on pixels k times larger, back on the camera's own
+    pixels (..., k h, k w): each one repeated k x k. Numpy arrays or torch tensors."""
+    if isinstance(classes, np.ndarray):
+        return classes.repeat(k, axis=-2).repeat(k, axis=-1)
+    return classes.repeat_interleave(k, dim=-2).repeat_interleave(k, dim=-1)
 
 
 def checked(classify, check: str):
@@ -855,8 +906,8 @@ def cameras(
     rule=None,
 ):
     """Test A: {camera name: {model: 6 x 4 confusion matrix}}, one camera at a time, each
-    model under every check (named <model>@<check>); rule (catena.threshold.Rule) beside
-    them, as "threshold"."""
+    model under every check (named <model>@<check>; a binned check only where the camera's
+    windows divide); rule (catena.threshold.Rule) beside them, as "threshold"."""
     import torch
     from torch.utils.data import DataLoader
 
@@ -897,6 +948,8 @@ def cameras(
                         ).to(device)
                         varied = (x.flatten(2)[..., order].view_as(x), told, four)
                         vy = y.flatten(1)[:, order].view_as(y)
+                    elif check in BINNED:  # read at a coarser pixel, scored at its own
+                        varied = binned(check, x, told, four)
                     else:
                         varied = vary(check, x, told, four)
                     if varied is None:
@@ -904,7 +957,10 @@ def cameras(
                     vx, vtold, vfour = varied
                     real = torch.ones(vx.shape[:2], dtype=torch.bool, device=device)
                     for model, logits in run_nets(nets, vx, vtold, real, vfour, amp).items():
-                        tally(conf, named(model, check), logits.argmax(dim=1), vy)
+                        classes = logits.argmax(dim=1)
+                        if check in BINNED:
+                            classes = spread(classes, BINNED[check])
+                        tally(conf, named(model, check), classes, vy)
         found[camera[0]] = {}
         for model, m in conf.items():
             six = np.zeros((6, 4), np.int64)
@@ -989,6 +1045,8 @@ def score_set(
         preds = {}
         work = item.coarse if item.coarse is not None else item
         for check in cards:
+            if check in BINNED:  # Test A's windows only: a scene's coarser grid is --grid
+                continue
             if check == SCRAMBLED:
                 moved, where, order = scrambled(work)
                 found = predict(classify, moved)
@@ -1113,7 +1171,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--cards",
         nargs="+",
         default=["honest"],
-        choices=[*CARDS, SCRAMBLED],
+        choices=[*CARDS, SCRAMBLED, *BINNED],
         help="checks (above)",
     )
     p.add_argument("--threshold", type=Path, help="thresholds beside (catena.threshold's JSON)")

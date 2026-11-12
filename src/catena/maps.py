@@ -64,7 +64,12 @@ class Kept:
         OmniCloudMask's maps."""
         out = {}
         for arm in E.ARMS:
-            seeds = [arrays[k] for k in sorted(arrays) if k.endswith(f"_{arm}")]
+            longer = [a for a in E.ARMS if a.endswith(f"_{arm}")]  # chain_real is not real
+            seeds = [
+                arrays[k]
+                for k in sorted(arrays)
+                if k.endswith(f"_{arm}") and not any(k.endswith(f"_{a}") for a in longer)
+            ]
             if seeds:
                 out[E.ARM_TITLES[arm]] = vote(seeds)
         out |= {name_of(k): arrays[k] for k in E.OCM if k in arrays}
