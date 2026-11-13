@@ -814,7 +814,8 @@ class Net:
 
 def load_runs(runs, device) -> dict[str, Net]:
     """Every arm of every finished run under the RUNS folders: {"seed0/real": Net, ...}.
-    A run without a list of its arms is the first big run's: real and sim, on the card."""
+    A run without a list of its arms is the first big run's: real and sim, on the card. An
+    arm made for the Hailo-8 is rebuilt so (BatchNorm, ReLU, nearest neighbours)."""
     import torch
 
     from catena.model import BandEncoder, Clarity, FixedBands
@@ -838,15 +839,17 @@ def load_runs(runs, device) -> dict[str, Net]:
                 if name in nets:
                     raise SystemExit(f"{name} in {where[name]} and {folder}: evaluate them apart")
                 fields, widths = int(design["fields"]), tuple(args["widths"])
+                hailo = bool(design.get("hailo", False))  # made for the Hailo-8
                 if design.get("code"):  # a trunk the architecture search found
                     from catena import nas
 
-                    trunk = nas.build_trunk(design["code"], 2 * args["stem"])
-                    net = nas.Candidate(BandEncoder(args["stem"], fields), trunk)
+                    trunk = nas.build_trunk(design["code"], 2 * args["stem"], hailo=hailo)
+                    head = BandEncoder(args["stem"], fields, hailo)
+                    net = nas.Candidate(head, trunk, hailo=hailo)
                 elif fields == 0:
-                    net = FixedBands(widths=widths, stem=args["stem"])
+                    net = FixedBands(widths=widths, stem=args["stem"], hailo=hailo)
                 else:
-                    net = Clarity(widths=widths, stem=args["stem"], fields=fields)
+                    net = Clarity(widths=widths, stem=args["stem"], fields=fields, hailo=hailo)
                 net.load_state_dict(state["models"][arm])
                 blind = bool(design.get("blind", False))
                 nets[name] = Net(net.to(device).eval(), fields, blind)

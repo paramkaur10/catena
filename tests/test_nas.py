@@ -7,6 +7,7 @@ search giving up); and a trunk it finds, trained as an arm and tested. Needs PyN
 
 from __future__ import annotations
 
+import copy
 import json
 
 import numpy as np
@@ -48,6 +49,33 @@ def test_a_trunk_for_any_window():
             assert net(*batch(5, size)).shape == (2, 4, size, size)
     with torch.no_grad():  # any bands, in any number
         assert net(*batch(13, 48)).shape == (2, 4, 48, 48)
+
+
+def test_a_trunk_made_for_the_hailo_8(monkeypatch):
+    torch.manual_seed(0)
+    trunk = nas.build_trunk(CODE, 16, size=24, hailo=True)
+    kinds = {type(m) for m in trunk.modules()}
+    assert torch.nn.BatchNorm2d in kinds and torch.nn.GroupNorm not in kinds
+    assert torch.nn.GELU not in kinds  # CODE's second layer asks for GELU: ReLU instead
+    plain = nas.build_trunk(CODE, 16, size=24)
+    assert torch.nn.GELU in {type(m) for m in plain.modules()}
+    modes = []
+    interpolate = torch.nn.functional.interpolate
+
+    def spy(*args, **kwargs):
+        modes.append(kwargs.get("mode", "nearest"))
+        return interpolate(*args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.functional, "interpolate", spy)
+    net = nas.Candidate(BandEncoder(8, desc.N_CARD, hailo=True), trunk, hailo=True).eval()
+    for size in (24, 40, 120, 240):
+        with torch.no_grad():
+            assert net(*batch(5, size)).shape == (2, 4, size, size)
+    assert modes and set(modes) == {"nearest"}  # every decoder stage
+    copied = copy.deepcopy(net)  # as the 8-bit twins are made
+    with torch.no_grad():
+        x, told, real = batch(4, 40)
+        assert torch.equal(copied(x, told, real), net(x, told, real))
 
 
 def test_the_head_of_a_run_stays_as_it_is(tmp_path):
@@ -263,3 +291,29 @@ def test_a_found_trunk_trained_and_tested(data, tmp_path):  # noqa: F811
     for bad in (["--arms", "nas", "sim"], ["--arms", "real", "sim", "--trunk", CODE]):
         with pytest.raises(SystemExit):
             C.parse_args(["x", *bad])
+
+
+def test_a_found_trunk_trained_for_the_hailo_8(data, tmp_path):  # noqa: F811
+    out = tmp_path / "flight"
+    more = ("--arms", "nas", "sim", "--trunk", CODE, "--hailo", "--freeze-norms", "0.5")
+    C.main(run_args(data, out, *more, "--stop-after", "1"))  # stopped while averaging
+    C.main(run_args(data, out, *more))
+    state = torch.load(out / "final.pt", map_location="cpu")
+    nas_arm = {"data": "sim", "fields": desc.N_CARD, "blind": False, "code": CODE, "hailo": True}
+    assert state["arms"]["nas"] == nas_arm and state["arms"]["sim"]["hailo"] is True
+    for arm in ("nas", "sim"):  # 4 steps: averaged over steps 0 and 1, frozen from step 2
+        counts = [int(v) for k, v in state["models"][arm].items() if k.endswith("batches_tracked")]
+        assert 2 in counts and set(counts) <= {0, 2}  # 0: a BatchNorm the forward never uses
+    config = json.loads((out / "config.json").read_text())
+    assert config["hailo"]["norms_averaged_from_step"] == 0
+    assert config["hailo"]["norms_frozen_from_step"] == 2
+    nets = E.load_runs([out], "cpu")
+    assert set(nets) == {"flight/nas", "flight/sim"}
+    kinds = {type(m) for m in nets["flight/nas"].net.modules()}
+    assert torch.nn.BatchNorm2d in kinds and torch.nn.GroupNorm not in kinds
+    x = np.random.default_rng(0).random((2, 4, 80, 80)).astype(np.float32)
+    told = np.zeros((4, desc.N_CHAIN_CARD), np.float32)
+    found = E.classifier(nets, torch.device("cpu"), False)(x, told, (0, 1, 2, 3))
+    assert {k: v.shape for k, v in found.items()} == {k: (2, 80, 80) for k in nets}
+    with pytest.raises(SystemExit):
+        C.parse_args(["x", "--hailo", "--freeze-norms", "0"])

@@ -3,6 +3,7 @@
     python -m catena.train_clarity OUT [--data /root/catena_data] [--seed 0] [--steps 60000]
         [--arms real sim] [--shares 0.4 0.2 0.2 0.2] [--devices cuda:0 cuda:1]
         [--q-weights 1 1 1] [--faults 0] [--fault-gain 0.3] [--fault-nir 0.4] [--coarser 0]
+        [--hailo] [--freeze-norms 0.9]
         [--chain-jitter 1] [--trunk CODE [CODE]]
 
 Clarity reads, for each band, only what every product states (catena.descriptor.card): its
@@ -62,6 +63,13 @@ One option changes what every arm learns from, made-up cameras or not:
                narrower, a known noise lower). Without it each real satellite has one pixel
                size, which the networks learn as a name; with it the pixel size says what it
                means. Drawn from a random stream of its own: at 0 every sample is as before.
+
+Made for the Hailo-8 (--hailo): every network of the run uses only layers the chip's compiler
+takes as they are (catena.model, catena.nas): BatchNorm for GroupNorm, ReLU for GELU, nearest
+neighbours for bilinear upsampling. A batch comes from one satellite, so BatchNorm's statistics
+of one batch are one satellite's: NORM_BATCHES batches before --freeze-norms of the steps, the
+statistics restart as a plain average of the batches (every satellite in its share), and from
+then on they are frozen, the rest of the training learning with the constants that fly.
 
 Each batch comes from one satellite, drawn with --shares (Sentinel-2, Landsat 8, HEO,
 PeruSat-1); the data under DATA:
@@ -138,9 +146,10 @@ RGBN = {  # where blue, green, red and near infrared sit among each satellite's 
 SAME_ARGS = ("seed", "steps", "batch", "size", "landsat_size", "heo_size", "perusat_size")
 SAME_ARGS += ("shares", "p_s2", "widths", "stem", "lr", "weight_decay", "warmup", "hold_out")
 SAME_ARGS += ("q_weights", "faults", "fault_gain", "fault_nir", "arms", "chain_jitter", "trunk")
-SAME_ARGS += ("coarser",)
+SAME_ARGS += ("coarser", "hailo", "freeze_norms")
 OLDER = {"q_weights": [1.0, 1.0, 1.0], "faults": 0.0, "fault_gain": 0.3, "fault_nir": 0.4}
-OLDER |= {"coarser": 0.0}
+OLDER |= {"coarser": 0.0, "hailo": False, "freeze_norms": 0.9}
+NORM_BATCHES = 500  # --hailo: the batches BatchNorm's statistics are averaged over, then frozen
 OLDER |= {"arms": list(VERSIONS), "chain_jitter": 1.0, "trunk": None}
 
 
@@ -171,18 +180,60 @@ ARMS = {
 NAS = ("nas", "nas2")  # the arms whose trunk is an architecture code
 
 
-def build(name: str, widths, stem: int, code: str | None = None) -> torch.nn.Module:
+def build(
+    name: str, widths, stem: int, code: str | None = None, hailo: bool = False
+) -> torch.nn.Module:
     """An arm's network, its weights drawn from torch's generator as it stands; a nas arm's
-    trunk is PyNAS's U-Net for the architecture code."""
+    trunk is PyNAS's U-Net for the architecture code. hailo: made for the Hailo-8."""
     if name in NAS:
         from catena import nas  # PyNAS is needed only here
 
         if not code:
             raise ValueError(f"the {name} arm needs an architecture code")
-        return nas.Candidate(BandEncoder(stem, ARMS[name].fields), nas.build_trunk(code, 2 * stem))
+        head = BandEncoder(stem, ARMS[name].fields, hailo)
+        return nas.Candidate(head, nas.build_trunk(code, 2 * stem, hailo=hailo), hailo=hailo)
     if ARMS[name].fields == 0:
-        return FixedBands(widths=tuple(widths), stem=stem)
-    return Clarity(widths=tuple(widths), stem=stem, fields=ARMS[name].fields)
+        return FixedBands(widths=tuple(widths), stem=stem, hailo=hailo)
+    return Clarity(widths=tuple(widths), stem=stem, fields=ARMS[name].fields, hailo=hailo)
+
+
+def batch_norms(net: torch.nn.Module) -> list:
+    """The BatchNorm layers of a network (none but in one made for the Hailo-8)."""
+    return [m for m in net.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+
+
+def norm_steps(args) -> tuple[int, int] | None:
+    """--hailo: the step from which BatchNorm's statistics are a plain average of the batches,
+    and the step from which they are frozen (never, at --freeze-norms 1); None without."""
+    if not args.hailo:
+        return None
+    frozen = round(args.freeze_norms * args.steps)
+    return max(frozen - NORM_BATCHES, 0), frozen
+
+
+def average_norms(net: torch.nn.Module, restart: bool = True) -> None:
+    """From now on BatchNorm's statistics are the plain average of the batches seen (restart:
+    from none; else going on from those a stopped run saved, with their count)."""
+    for m in batch_norms(net):
+        if restart:
+            m.reset_running_stats()
+        m.momentum = None
+
+
+def freeze_norms(net: torch.nn.Module) -> None:
+    """BatchNorm's statistics frozen: used as they fly, never updated again."""
+    net.frozen_norms = True
+    for m in batch_norms(net):
+        m.eval()
+
+
+def train_mode(net: torch.nn.Module) -> torch.nn.Module:
+    """net.train(), with frozen BatchNorm statistics kept frozen."""
+    net.train()
+    if getattr(net, "frozen_norms", False):
+        for m in batch_norms(net):
+            m.eval()
+    return net
 
 
 def codes_of(arms, trunk) -> dict[str, str]:
@@ -535,14 +586,16 @@ def validate(models: dict, devices: dict, data: DataLoader, amp: dict) -> dict:
             pairs = y[ok] * 4 + logits.argmax(dim=1)[ok]
             conf[a][c] += torch.bincount(pairs, minlength=16).view(4, 4)
     for net in models.values():
-        net.train()
+        train_mode(net)
     return {a: m.cpu().numpy() for a, m in conf.items()}
 
 
 def designs(arms, config: dict) -> dict:
-    """Each arm's design, with its architecture code for a nas arm."""
+    """Each arm's design, with its architecture code for a nas arm, and hailo when it is made
+    for the Hailo-8."""
     trunks = config.get("trunks", {})
-    return {a: asdict(ARMS[a]) | ({"code": trunks[a]} if a in trunks else {}) for a in arms}
+    hailo = {"hailo": True} if config.get("args", {}).get("hailo") else {}
+    return {a: asdict(ARMS[a]) | ({"code": trunks[a]} if a in trunks else {}) | hailo for a in arms}
 
 
 def save(path: Path, step: int, models: dict, config: dict, opts=None, scheds=None) -> None:
@@ -689,6 +742,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--coarser", type=float, default=0.0, help="share of real satellites' batches coarser"
     )
+    p.add_argument("--hailo", action="store_true", help="networks made for the Hailo-8")
+    p.add_argument(
+        "--freeze-norms", type=float, default=0.9, help="--hailo: BatchNorm frozen at this share"
+    )
     p.add_argument("--trunk", nargs="+", help="nas, nas2: their architecture codes (catena.nas)")
     p.add_argument("--widths", type=int, nargs=4, default=[32, 64, 128, 256])
     p.add_argument("--stem", type=int, default=16)
@@ -718,6 +775,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p.error("--chain-jitter: 0 or more")
     if not 0 <= args.coarser <= 1:
         p.error("--coarser within 0 and 1")
+    if not 0 < args.freeze_norms <= 1:
+        p.error("--freeze-norms above 0, at most 1")
     if args.coarser > 0 and any(
         getattr(args, k) % 16 for k in ("landsat_size", "heo_size", "perusat_size")
     ):
@@ -746,7 +805,8 @@ def main(argv: list[str] | None = None) -> None:
     models = {}
     for a in arms:
         torch.manual_seed(args.seed)  # arms of one design start from the same weights
-        models[a] = build(a, args.widths, args.stem, trunks.get(a)).to(devices[a]).train()
+        net = build(a, args.widths, args.stem, trunks.get(a), args.hailo)
+        models[a] = net.to(devices[a]).train()
     opts = {
         v: torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         for v, net in models.items()
@@ -814,6 +874,12 @@ def main(argv: list[str] | None = None) -> None:
             "coarser_pixels": {
                 "share_of_batches": args.coarser,
                 "factors": {k: list(v) for k, v in COARSER.items()},
+            },
+            "hailo": {
+                "made_for_hailo8": args.hailo,
+                "layers": "BatchNorm, ReLU, nearest neighbours" if args.hailo else None,
+                "norms_averaged_from_step": norm_steps(args)[0] if args.hailo else None,
+                "norms_frozen_from_step": norm_steps(args)[1] if args.hailo else None,
             },
             "landsat_scenes": [s.name for s in data["landsat8"].scenes] if data["landsat8"] else [],
             "heo_scenes": [s.name for s in data["heo"].scenes] if data["heo"] else [],
@@ -901,6 +967,21 @@ def main(argv: list[str] | None = None) -> None:
             "(x2), HEO and PeruSat-1 (x2 or x3), the card told the new pixel",
             flush=True,
         )
+    norms = norm_steps(args)
+    if norms:
+        average, frozen = norms
+        when = f"frozen from step {frozen:,}" if frozen < args.steps else "never frozen"
+        print(
+            f"  made for the Hailo-8: BatchNorm, ReLU, nearest-neighbour upsampling; BatchNorm's "
+            f"statistics a plain average from step {average:,}, {when}",
+            flush=True,
+        )
+        if step >= frozen:  # going on after the statistics were frozen
+            for net in models.values():
+                freeze_norms(net)
+        elif step > average:  # going on while they were being averaged
+            for net in models.values():
+                average_norms(net, restart=False)
     if step:
         print(f"going on from step {step:,} (last.pt)", flush=True)
 
@@ -909,6 +990,12 @@ def main(argv: list[str] | None = None) -> None:
     counts = Counter()
     began, first_step, logged = time.perf_counter(), step, step
     for batch in train_loader:
+        if norms and step == norms[0]:  # BatchNorm's statistics: a plain average from here
+            for net in models.values():
+                average_norms(net)
+        if norms and step == norms[1]:  # and frozen from here, as they fly
+            for net in models.values():
+                freeze_norms(net)
         counts[SOURCES[int(batch["source"][0])]] += 1
         for a in arms:
             x, told, real, label = arm_inputs(batch, a)

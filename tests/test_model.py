@@ -1,6 +1,7 @@
 """The network: output shape and size, indifference to band order and to padding, older
 networks reading the fields they know, folding FiLM into the GroupNorm without changing the
-output, gradients reaching every part, and the baseline on fixed bands."""
+output, gradients reaching every part, the baseline on fixed bands, and the networks made for
+the Hailo-8 (BatchNorm, ReLU, nearest neighbours; FiLM folded into BatchNorm alike)."""
 
 from __future__ import annotations
 
@@ -103,3 +104,59 @@ def test_the_baseline_on_fixed_bands():
     small_net(torch.rand(2, 4, 24, 24)).square().mean().backward()
     for name, p in small_net.named_parameters():
         assert p.grad is not None, name
+
+
+def test_networks_made_for_the_hailo_8(monkeypatch):
+    torch.manual_seed(0)
+    clarity = Clarity(widths=(8, 8, 8, 8), stem=8, fields=N_CARD, hailo=True).eval()
+    fixed = FixedBands(widths=(8, 8, 8, 8), stem=8, hailo=True).eval()
+    plain = Clarity(widths=(8, 8, 8, 8), stem=8, fields=N_CARD).eval()
+    assert set(clarity.state_dict()) - set(plain.state_dict())  # BatchNorm's statistics
+    for net in (clarity, fixed):
+        kinds = {type(m) for m in net.modules()}
+        assert torch.nn.BatchNorm2d in kinds and torch.nn.GroupNorm not in kinds
+    gelus = [n for n, m in clarity.named_modules() if isinstance(m, torch.nn.GELU)]
+    assert gelus == ["bands.embed.1"]  # the card's path, on the ground
+    assert not any(isinstance(m, torch.nn.GELU) for m in fixed.modules())
+    seen = {"gelu": [], "modes": []}
+    gelu, interpolate = torch.nn.functional.gelu, torch.nn.functional.interpolate
+
+    def spy_gelu(x, *args, **kwargs):
+        seen["gelu"].append(x.dim())
+        return gelu(x, *args, **kwargs)
+
+    def spy_interpolate(*args, **kwargs):
+        seen["modes"].append(kwargs.get("mode", "nearest"))
+        return interpolate(*args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.functional, "gelu", spy_gelu)
+    monkeypatch.setattr(torch.nn.functional, "interpolate", spy_interpolate)
+    x, d, real = inputs(bands=4, size=24)
+    with torch.no_grad():
+        assert clarity(x, d[..., :N_CARD], real).shape == (2, 4, 24, 24)
+        assert fixed(x).shape == (2, 4, 24, 24)
+    assert seen["gelu"] and max(seen["gelu"]) <= 3  # never on an image: only on the cards
+    assert seen["modes"] and set(seen["modes"]) == {"nearest"}
+
+
+def test_folding_into_batchnorm_keeps_the_output():
+    torch.manual_seed(0)
+    net = Clarity(widths=(8, 8, 8, 8), stem=8, fields=N_CARD, hailo=True)
+    for m in net.modules():  # statistics and FiLM as a trained network has them
+        if isinstance(m, torch.nn.BatchNorm2d):
+            m.running_mean.uniform_(-0.5, 0.5)
+            m.running_var.uniform_(0.5, 2.0)
+        if isinstance(m, FiLM):
+            torch.nn.init.normal_(m.to_gb.weight, std=0.1)
+            torch.nn.init.normal_(m.to_gb.bias, std=0.1)
+    net.eval()
+    x, d, real = inputs(batch=1, bands=4)
+    d = d[..., :N_CARD]
+    with torch.no_grad():
+        before = net(x, d, real)
+        _, z = net.bands(x, d, real)
+        for level in [*net.down, *net.up]:
+            for block in level:
+                fold_block(block, z)
+        after = net(x, d, real)
+    assert torch.allclose(before, after, atol=1e-5)

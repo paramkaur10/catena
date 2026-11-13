@@ -20,6 +20,14 @@ sensor every FiLM is a constant that fold_block() bakes into the GroupNorm befor
 card (fields=6, catena.descriptor.card), as in the big run, 2,184,565. The budget is 6 MB at
 float16, the copy that flies: 3 M parameters.
 
+Made for the Hailo-8 (hailo=True): what runs on board uses only layers its compiler takes as
+they are. BatchNorm for GroupNorm: at use its statistics are constants that fold into the
+convolution before it (GroupNorm's are each image's own, a layer the chip does not have); ReLU
+for GELU; nearest neighbours for bilinear upsampling. The card's path (the descriptor MLP and
+the Transformer layer) runs on the ground and keeps GELU. A batch comes from one satellite, so
+BatchNorm's statistics are averaged over many batches and then frozen before training ends
+(catena.train_clarity --hailo).
+
 FixedBands, the baseline without a band encoder: the same U-Net, without FiLM, on four bands
 in a fixed order (blue, green, red, near infrared), as a network made for one band set is.
 Its stem (two 3x3 convolutions) gives the U-Net the 32 channels the band encoder gives
@@ -38,6 +46,23 @@ from catena.descriptor import N_FIELDS
 EMB = 64
 
 
+def activation(hailo: bool):
+    """The image's path's activation: ReLU on what the Hailo-8 runs, GELU else."""
+    return F.relu if hailo else F.gelu
+
+
+def norm(channels: int, hailo: bool) -> nn.Module:
+    """BatchNorm (constants at use, folded into the convolution) or GroupNorm."""
+    return nn.BatchNorm2d(channels) if hailo else nn.GroupNorm(8, channels)
+
+
+def upsample(f: torch.Tensor, hailo: bool) -> torch.Tensor:
+    """f twice as large: nearest neighbours on the Hailo-8, bilinear else."""
+    if hailo:
+        return F.interpolate(f, scale_factor=2, mode="nearest")
+    return F.interpolate(f, scale_factor=2, mode="bilinear", align_corners=False)
+
+
 class FiLM(nn.Module):
     """y = (1 + dg) * x + db per channel, with dg and db computed from a vector z.
     Starts at zero, so a new FiLM layer changes nothing until training gives it a use."""
@@ -54,24 +79,27 @@ class FiLM(nn.Module):
 
 
 class ConvFiLM(nn.Module):
-    """3x3 conv -> GroupNorm -> FiLM(z) -> GELU: one block of the U-Net."""
+    """3x3 conv -> GroupNorm -> FiLM(z) -> GELU: one block of the U-Net (hailo: BatchNorm,
+    ReLU)."""
 
-    def __init__(self, cin: int, cout: int):
+    def __init__(self, cin: int, cout: int, hailo: bool = False):
         super().__init__()
         self.conv = nn.Conv2d(cin, cout, 3, padding=1, bias=False)
-        self.norm = nn.GroupNorm(8, cout)
+        self.norm = norm(cout, hailo)
         self.film = FiLM(cout)
+        self.hailo = hailo
 
     def forward(self, x, z):
-        return F.gelu(self.film(self.norm(self.conv(x)), z))
+        return activation(self.hailo)(self.film(self.norm(self.conv(x)), z))
 
 
 class BandEncoder(nn.Module):
     """Any number of bands, each with its descriptor -> one feature map and a sensor vector."""
 
-    def __init__(self, width: int = 16, fields: int = N_FIELDS):
+    def __init__(self, width: int = 16, fields: int = N_FIELDS, hailo: bool = False):
         super().__init__()
         self.fields = fields  # a network trained with fewer fields reads only the first ones
+        self.hailo = hailo  # the image's path made for the Hailo-8: ReLU
         self.embed = nn.Sequential(nn.Linear(fields, EMB), nn.GELU(), nn.Linear(EMB, EMB))
         self.mix = nn.TransformerEncoderLayer(
             EMB, nhead=4, dim_feedforward=128, dropout=0.0, batch_first=True
@@ -89,8 +117,9 @@ class BandEncoder(nn.Module):
         e = e.masked_fill(~real[..., None], 0.0)  # padding slots carry nothing
         eb = e.reshape(b * n, EMB)
         f = x.reshape(b * n, 1, h, w)
-        f = F.gelu(self.film1(self.stem1(f), eb))
-        f = F.gelu(self.film2(self.stem2(f), eb)).reshape(b, n, -1, h, w)
+        act = activation(self.hailo)
+        f = act(self.film1(self.stem1(f), eb))
+        f = act(self.film2(self.stem2(f), eb)).reshape(b, n, -1, h, w)
         weight = self.score(e).squeeze(-1).masked_fill(~real, float("-inf")).softmax(dim=1)
         mean = (weight.to(f.dtype)[:, :, None, None, None] * f).sum(dim=1)  # (B, C, H, W)
         peak = f.masked_fill(~real[:, :, None, None, None], float("-inf")).amax(dim=1)
@@ -100,17 +129,23 @@ class BandEncoder(nn.Module):
 
 class Clarity(nn.Module):
     def __init__(
-        self, widths=(32, 64, 128, 256), classes: int = 4, stem: int = 16, fields: int = N_FIELDS
+        self,
+        widths=(32, 64, 128, 256),
+        classes: int = 4,
+        stem: int = 16,
+        fields: int = N_FIELDS,
+        hailo: bool = False,
     ):
         super().__init__()
-        self.bands = BandEncoder(stem, fields)
+        self.hailo = hailo
+        self.bands = BandEncoder(stem, fields, hailo)
         ins = [2 * stem, *widths[:-1]]
         self.down = nn.ModuleList(
-            nn.ModuleList([ConvFiLM(i, o), ConvFiLM(o, o)])
+            nn.ModuleList([ConvFiLM(i, o, hailo), ConvFiLM(o, o, hailo)])
             for i, o in zip(ins, widths, strict=True)
         )
         self.up = nn.ModuleList(
-            nn.ModuleList([ConvFiLM(deep + o, o), ConvFiLM(o, o)])
+            nn.ModuleList([ConvFiLM(deep + o, o, hailo), ConvFiLM(o, o, hailo)])
             for deep, o in zip(widths[:0:-1], widths[-2::-1], strict=True)
         )
         self.head = nn.Conv2d(widths[0], classes, 1)
@@ -123,21 +158,23 @@ class Clarity(nn.Module):
             skips.append(f)
         skips.pop()  # the deepest map is f itself
         for first, second in self.up:
-            f = F.interpolate(f, scale_factor=2, mode="bilinear", align_corners=False)
+            f = upsample(f, self.hailo)
             f = second(first(torch.cat([f, skips.pop()], dim=1), z), z)
         return self.head(f)  # (B, 4, H, W) logits; H and W must be multiples of 8
 
 
 class ConvBlock(nn.Module):
-    """3x3 conv -> GroupNorm -> GELU: ConvFiLM without FiLM, one block of FixedBands."""
+    """3x3 conv -> GroupNorm -> GELU: ConvFiLM without FiLM, one block of FixedBands (hailo:
+    BatchNorm, ReLU)."""
 
-    def __init__(self, cin: int, cout: int):
+    def __init__(self, cin: int, cout: int, hailo: bool = False):
         super().__init__()
         self.conv = nn.Conv2d(cin, cout, 3, padding=1, bias=False)
-        self.norm = nn.GroupNorm(8, cout)
+        self.norm = norm(cout, hailo)
+        self.hailo = hailo
 
     def forward(self, x):
-        return F.gelu(self.norm(self.conv(x)))
+        return activation(self.hailo)(self.norm(self.conv(x)))
 
 
 class FixedBands(nn.Module):
@@ -145,21 +182,30 @@ class FixedBands(nn.Module):
     (blue, green, red, near infrared). forward(x, d=None, real=None) takes x (B, bands, H, W)
     and ignores d and real, so it is called as Clarity is."""
 
-    def __init__(self, widths=(32, 64, 128, 256), classes: int = 4, stem: int = 16, bands: int = 4):
+    def __init__(
+        self,
+        widths=(32, 64, 128, 256),
+        classes: int = 4,
+        stem: int = 16,
+        bands: int = 4,
+        hailo: bool = False,
+    ):
         super().__init__()
+        self.hailo = hailo
+        act = nn.ReLU if hailo else nn.GELU
         self.stem = nn.Sequential(
             nn.Conv2d(bands, 2 * stem, 3, padding=1),
-            nn.GELU(),
+            act(),
             nn.Conv2d(2 * stem, 2 * stem, 3, padding=1),
-            nn.GELU(),
+            act(),
         )
         ins = [2 * stem, *widths[:-1]]
         self.down = nn.ModuleList(
-            nn.ModuleList([ConvBlock(i, o), ConvBlock(o, o)])
+            nn.ModuleList([ConvBlock(i, o, hailo), ConvBlock(o, o, hailo)])
             for i, o in zip(ins, widths, strict=True)
         )
         self.up = nn.ModuleList(
-            nn.ModuleList([ConvBlock(deep + o, o), ConvBlock(o, o)])
+            nn.ModuleList([ConvBlock(deep + o, o, hailo), ConvBlock(o, o, hailo)])
             for deep, o in zip(widths[:0:-1], widths[-2::-1], strict=True)
         )
         self.head = nn.Conv2d(widths[0], classes, 1)
@@ -172,7 +218,7 @@ class FixedBands(nn.Module):
             skips.append(f)
         skips.pop()  # the deepest map is f itself
         for first, second in self.up:
-            f = F.interpolate(f, scale_factor=2, mode="bilinear", align_corners=False)
+            f = upsample(f, self.hailo)
             f = second(first(torch.cat([f, skips.pop()], dim=1)))
         return self.head(f)  # (B, 4, H, W) logits; H and W must be multiples of 8
 
@@ -188,8 +234,8 @@ class NoFiLM(nn.Module):
 
 @torch.no_grad()
 def fold_block(block: ConvFiLM, z: torch.Tensor) -> None:
-    """For one fixed sensor (z of shape (1, EMB)): bake FiLM into the GroupNorm's own
-    scale and shift. g * (w * n + b) + db = (g * w) * n + (g * b + db)."""
+    """For one fixed sensor (z of shape (1, EMB)): bake FiLM into the norm's own scale and
+    shift (GroupNorm's or BatchNorm's). g * (w * n + b) + db = (g * w) * n + (g * b + db)."""
     dg, db = block.film.to_gb(z).chunk(2, dim=-1)
     g = 1 + dg[0]
     block.norm.bias.mul_(g).add_(db[0])

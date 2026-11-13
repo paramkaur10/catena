@@ -15,6 +15,9 @@ two changes for this data:
   - any window size: PyNAS sizes its decoder for one input; here every candidate is built,
     and so checked, at the smallest window the training draws (48 px: Sentinel-2 at 50 m),
     each decoder stage is brought to its skip's size, and the output to the window's.
+A trunk made for the Hailo-8 (build_trunk hailo=True, train_clarity --hailo) keeps PyNAS's
+BatchNorm, takes ReLU wherever its code says GELU, and brings each decoder stage to its skip's
+size by nearest neighbours, not bilinear: only layers the chip's compiler takes as they are.
 PyNAS reads Catena's copy of its config (catena/pynas.ini, through PYNAS_CONFIG): a layer
 keeps or doubles the channels of the one before, as a U-Net's levels do.
 
@@ -78,7 +81,7 @@ import time
 import traceback
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import torch
@@ -174,27 +177,59 @@ def group_norms(module: nn.Module) -> nn.Module:
     return module
 
 
-def build_trunk(code_or_layers, channels: int, size: int = 48) -> nn.Module:
+def nearest_forward(self, encoder_features, verbose=False):
+    """PyNAS's UNetDecoder.forward with each stage brought to its skip's size by nearest
+    neighbours (a decoder made for the Hailo-8, set by nearest())."""
+    if len(encoder_features) != self.num_stages + 1:
+        raise ValueError(f"expected {self.num_stages + 1} encoder features")
+    x = encoder_features[-1]  # the bottleneck
+    for i in range(self.num_stages):
+        skip = encoder_features[self.num_stages - 1 - i]
+        x = self.up_convs[i](x)
+        if x.shape[2:] != skip.shape[2:]:
+            x = F.interpolate(x, size=skip.shape[2:], mode="nearest")
+        x = self.conv_blocks[i](torch.cat([x, skip], dim=1))
+    return self.out_conv(x)
+
+
+def nearest(net: nn.Module) -> nn.Module:
+    """A trunk made for any size (any_size) whose decoder upsamples by nearest neighbours."""
+    net.decoder.forward = MethodType(nearest_forward, net.decoder)
+    return net
+
+
+def build_trunk(code_or_layers, channels: int, size: int = 48, hailo: bool = False) -> nn.Module:
     """PyNAS's U-Net for an architecture code (or its parsed layers) on `channels` channels,
     four classes out: built, and so checked, at size x size pixels, then made for any size,
-    with GroupNorm."""
+    with GroupNorm; or, made for the Hailo-8 (hailo), with PyNAS's BatchNorm, ReLU for GELU
+    and nearest-neighbour upsampling."""
     p = pynas()
     layers = code_or_layers
     if isinstance(code_or_layers, str):
         layers = p.builder.parse_architecture_code(code_or_layers)
+    if hailo:
+        layers = [
+            {**layer, "activation": "ReLU"} if layer.get("activation") == "GELU" else layer
+            for layer in layers
+        ]
     net = p.unet.GenericUNetNetwork(
         layers, input_channels=channels, input_height=size, input_width=size, num_classes=CLASSES
     )
+    if hailo:
+        return nearest(any_size(net))
     return group_norms(any_size(net))
 
 
 class Candidate(nn.Module):
     """A band encoder in front of a trunk: any bands with their chain cards in, the four
-    classes out, at the window's size. fixed: the band encoder's weights stay as they are."""
+    classes out, at the window's size. fixed: the band encoder's weights stay as they are.
+    hailo: the output brought to the window's size by nearest neighbours."""
 
-    def __init__(self, head: BandEncoder, trunk: nn.Module, fixed: bool = False):
+    def __init__(
+        self, head: BandEncoder, trunk: nn.Module, fixed: bool = False, hailo: bool = False
+    ):
         super().__init__()
-        self.head, self.trunk, self.fixed = head, trunk, fixed
+        self.head, self.trunk, self.fixed, self.hailo = head, trunk, fixed, hailo
         if fixed:
             self.head.requires_grad_(False)
 
@@ -210,7 +245,9 @@ class Candidate(nn.Module):
         with torch.set_grad_enabled(torch.is_grad_enabled() and not self.fixed):
             features, _ = self.head(x, told, real)
         out = self.trunk(features)
-        if out.shape[-2:] != x.shape[-2:]:
+        if out.shape[-2:] != x.shape[-2:] and self.hailo:
+            out = F.interpolate(out, size=x.shape[-2:], mode="nearest")
+        elif out.shape[-2:] != x.shape[-2:]:
             out = F.interpolate(out, size=x.shape[-2:], mode="bilinear", align_corners=False)
         return out
 
