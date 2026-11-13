@@ -4,7 +4,7 @@ test the method) on six test sets, beside OmniCloudMask wherever its predictions
     python -m catena.evaluate_clarity RUNS [RUNS ...] [--data /root/catena_data]
         [--tests A B C D E F] [--device cuda:0] [--windows 800] [--ocm] [--sensei] [--maps DIR]
         [--out CSV] [--cards honest shuffled "pixel x3" ... "pixels scrambled" "binned x3"]
-        [--grid 10]
+        [--grid 10] [--cameras sentinel2 ...] [--per-window FILE.csv]
         [--int8] [--threshold RUNS/threshold/threshold.json]
 
 Each RUNS folder holds finished runs (final.pt) at any depth, one folder per seed, as
@@ -103,6 +103,16 @@ and two that act on what a card says, on Test A's windows only:
                     of B-F a coarser grid is --grid.
 Without --out, a run with checks other than honest writes clarity_tests_<tests>[_ocm]_cards.csv
 (and with SEnSeIv2, _sensei before .csv); the maps (--maps) keep the honest predictions only.
+
+Test A's cameras one by one (--cameras NAME ...): only these of catena.evaluate's cameras,
+"sentinel2" alone for Sentinel-2 as delivered, the real camera. Their windows and noise are
+the ones a run of all 23 gives them.
+
+Window by window (--per-window FILE.csv): Sentinel-2 as delivered, every window of Test A
+on a row of its own for each model and check: the window (its patch, row, column and sun
+zenith) and its 4 x 4 confusion (rows the label: clear, thin, thick, shadow; columns the
+prediction), so the real windows can be sorted by light (catena.light). With --cameras or
+--per-window, --out names the CSV.
 
 Thresholds (--threshold FILE, from catena.threshold): the best rule a depth-4 tree of
 thresholds on brightness, whiteness, haze and near infrared makes, fitted on the validation
@@ -893,6 +903,21 @@ def tally(conf: dict, key: str, classes, y) -> None:
     conf[key] += torch.bincount(y[ok] * 4 + classes[ok], minlength=16).view(4, 4)
 
 
+def window_confusions(classes, y):
+    """(n, 4, 4) confusions of n windows (torch): y the labels, classes the predicted, both
+    (n, h, w); a pixel without a label left out."""
+    import torch
+
+    n = y.shape[0]
+    ok = y < 4
+    window = torch.arange(n, device=y.device).view(n, 1, 1).expand_as(y)
+    index = (window * 16 + y * 4 + classes)[ok]
+    return torch.bincount(index, minlength=n * 16).view(n, 4, 4)
+
+
+WINDOW_COLUMNS = ("camera", "window", "patch", "row", "col", "sun_zenith", "model", "confusion")
+
+
 def cameras(
     nets: dict,
     chips: Path,
@@ -904,10 +929,14 @@ def cameras(
     batch: int,
     cards=("honest",),
     rule=None,
+    only=None,
+    per_window: Path | None = None,
 ):
     """Test A: {camera name: {model: 6 x 4 confusion matrix}}, one camera at a time, each
     model under every check (named <model>@<check>; a binned check only where the camera's
-    windows divide); rule (catena.threshold.Rule) beside them, as "threshold"."""
+    windows divide); rule (catena.threshold.Rule) beside them, as "threshold". only: the
+    names of the cameras to run (None: all). per_window: a CSV of Sentinel-2 as delivered,
+    window by window (WINDOW_COLUMNS)."""
     import torch
     from torch.utils.data import DataLoader
 
@@ -916,9 +945,16 @@ def cameras(
     from catena.evaluate import TEST_CAMERAS, CameraWindows
     from catena.train_clarity import rgbn_slots
 
+    names = [c[0] for c in TEST_CAMERAS]
+    unknown = sorted(set(only or ()) - set(names))
+    if unknown:
+        raise SystemExit(f"--cameras: no camera {', '.join(unknown)}; the cameras: {names}")
     windows = loader.GridWindows(chips, "test", size=size)
-    found = {}
-    for index, camera in enumerate(TEST_CAMERAS):
+    found, rows = {}, []
+    for index, camera in enumerate(TEST_CAMERAS):  # index: the noise of a run of all 23
+        if only and camera[0] not in only:
+            continue
+        one_by_one = per_window is not None and camera[0] == "sentinel2"
         began = time.perf_counter()
         data = CameraWindows(windows, n, camera, index)
         batches = DataLoader(
@@ -961,6 +997,21 @@ def cameras(
                         if check in BINNED:
                             classes = spread(classes, BINNED[check])
                         tally(conf, named(model, check), classes, vy)
+                        if one_by_one:
+                            each = window_confusions(classes, vy).cpu().numpy()
+                            for i, m in enumerate(each):
+                                rows.append(
+                                    {
+                                        "camera": camera[0],
+                                        "window": k * batch + i,
+                                        "patch": b["id"][i],
+                                        "row": int(b["row"][i]),
+                                        "col": int(b["col"][i]),
+                                        "sun_zenith": f"{float(b['sun_zenith'][i]):.2f}",
+                                        "model": named(model, check),
+                                        "confusion": " ".join(str(int(v)) for v in m.ravel()),
+                                    }
+                                )
         found[camera[0]] = {}
         for model, m in conf.items():
             six = np.zeros((6, 4), np.int64)
@@ -968,6 +1019,13 @@ def cameras(
             found[camera[0]][model] = six
         seconds = time.perf_counter() - began
         print(f"  A {camera[0]:<26}{len(data):>5} windows {seconds:5.0f} s", flush=True)
+    if per_window is not None:
+        per_window.parent.mkdir(parents=True, exist_ok=True)
+        with open(per_window, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=WINDOW_COLUMNS)
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"  A window by window: {per_window} ({len(rows)} rows)", flush=True)
     return found
 
 
@@ -1127,13 +1185,15 @@ def camera_lines(found: dict, size: int = TILE) -> tuple[list[dict], list[str]]:
             rows.append(row("A", "sentinel2", camera, model, size, conf, s, True))
     groups = [
         ("Sentinel-2 as delivered", [c for c in per_camera if c == "sentinel2"]),
-        ("18 cameras inside the range", [c for c in per_camera if c.startswith("rgbn_")]),
-        ("4 cameras beyond the range", [c for c in per_camera if c.startswith("beyond_")]),
+        ("cameras inside the range", [c for c in per_camera if c.startswith("rgbn_")]),
+        ("cameras beyond the range", [c for c in per_camera if c.startswith("beyond_")]),
     ]
     lines = ["\nTest A: CloudSEN12+ test split (Sentinel-2, seen), per camera, then averaged"]
     for title, cameras in groups:
         if not cameras:
             continue
+        if title.startswith("cameras"):
+            title = f"{len(cameras)} {title}"
         models = dict.fromkeys(m for c in cameras for m in per_camera[c])
         mean = {
             model: {
@@ -1176,10 +1236,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--threshold", type=Path, help="thresholds beside (catena.threshold's JSON)")
     p.add_argument("--grid", type=float, help="predict sets finer than this (m) on a grid of it")
+    p.add_argument("--cameras", nargs="+", help="Test A: only these cameras")
+    p.add_argument("--per-window", type=Path, help="Test A: Sentinel-2 window by window, a CSV")
     p.add_argument("--int8", action="store_true", help="each network's 8-bit twin instead of it")
     args = p.parse_args(argv)
     if args.a_size <= 0 or args.a_size % 24:
         p.error("--a-size must be a multiple of 24: of 8 at 10 m and at 30 m")
+    if (args.cameras or args.per_window) and not args.out:
+        p.error("--cameras and --per-window: name the CSV with --out")
     return args
 
 
@@ -1253,6 +1317,8 @@ def main(argv: list[str] | None = None) -> None:
                 args.batch,
                 args.cards,
                 rule,
+                args.cameras,
+                args.per_window,
             )
             keep(*camera_lines(found, args.a_size))
         else:

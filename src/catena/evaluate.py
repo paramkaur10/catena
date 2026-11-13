@@ -121,7 +121,14 @@ class CameraWindows(Dataset):
         x, d, real, label = T.render(
             s["image"], s["label"], s["sun_zenith"], q, self.keep, camera, rng
         )
-        return {"image": x, "real": real, "d_told": d, "d_blind": desc.blind(d), "label": label}
+        where = {"id": s["id"], "row": s["row"], "col": s["col"], "sun_zenith": s["sun_zenith"]}
+        return {
+            "image": x,
+            "real": real,
+            "d_told": d,
+            "d_blind": desc.blind(d),
+            "label": label,
+        } | where
 
 
 def load_arms(run: Path, device: torch.device) -> dict:

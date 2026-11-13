@@ -789,6 +789,111 @@ def test_omnicloudmask_beside_on_landsat(data, monkeypatch):
     ]
 
 
+def test_the_light_of_the_real_scenes(data, tmp_path, capsys):
+    from catena import light
+
+    out = tmp_path / "light.csv"
+    light.main([str(data), "--out", str(out)])
+    with open(out, newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert list(rows[0]) == list(light.COLUMNS)
+    by = {(r["set"], r["scene"]): r for r in rows}
+    assert {s for s, _ in by} == {
+        "landsat8",
+        "landsat7",
+        "heo_test",
+        "heo_stress",
+        "eaglet2",
+        "phisat2",
+    }
+    assert {n for s, n in by if s.startswith("heo")} == {
+        n for n, r in HEO_SCENES.items() if r != "train"
+    }
+    l8 = [by["landsat8", n] for n in ("LC80000002014001LGN00", "LC80000012014002LGN00")]
+    assert [float(r["sun_zenith"]) for r in l8] == [50.0, 40.0]  # 90 - SUN_ELEVATION
+    assert all(r["source"] == "mtl" and float(r["snr_dark"]) > 0 for r in l8)  # its noise is known
+    assert float(l8[0]["snr_dark"]) < float(l8[1]["snr_dark"])  # less light, less signal
+    assert float(l8[0]["snr_bright"]) > float(l8[0]["snr_dark"])
+    l7 = [r for (s, _), r in by.items() if s == "landsat7"]
+    assert [float(r["sun_zenith"]) for r in l7] == [60.0]
+    for r in [r for (s, _), r in by.items() if s in ("heo_test", "heo_stress", "eaglet2")]:
+        assert r["source"] == "computed" and r["sun_zenith"] == r["computed"]  # no STAC sun
+        assert 20 < float(r["sun_zenith"]) < 80 and 40 < float(r["lat"]) < 43  # Italy, daytime
+        assert r["snr_dark"] == ""  # not known
+    phi = by["phisat2", "PHISAT2_20261025T110655"]
+    assert (
+        phi["source"] == "computed" and 46 < float(phi["lat"]) < 47 and 9 < float(phi["lon"]) < 10
+    )
+    assert "wrote" in capsys.readouterr().out
+
+
+def test_where_the_light_comes_from(tmp_path):
+    from datetime import UTC, datetime
+
+    from catena import light
+
+    when = light.stamp("IMH12_20260930T092923")
+    assert when == datetime(2026, 9, 30, 9, 29, 23, tzinfo=UTC) and light.stamp("p109_r84") is None
+    product = tmp_path / "x.zip"
+    item = {"properties": {"datetime": "2026-10-17T09:39:52Z", "view:sun_elevation": 35.0}}
+    with zipfile.ZipFile(product, "w") as z:
+        z.writestr("x/readme.json", "not json")
+        z.writestr("x/x.json", json.dumps(item))
+    properties = light.stac_item(product)
+    assert properties["view:sun_elevation"] == 35.0 and light.stac_item(tmp_path / "no.zip") == {}
+    assert light.when_of(properties, "IME04_20261017T000000") == datetime(
+        2026, 10, 17, 9, 39, 52, tzinfo=UTC
+    )  # the STAC item's time before the name's
+    assert light.when_of({}, "IME04_20261017T093952").hour == 9
+    label = tmp_path / "label.tif"
+    geotiff(label, np.zeros((10, 10), np.uint8), 5)
+    scene = eaglet2.Scene("IME04_20261017T093952", "test", product, label)
+    (r,) = light.iride([("E", "eaglet2", scene)])
+    assert r["source"] == "stac" and float(r["sun_zenith"]) == 55.0
+    assert abs(float(r["computed"]) - 55.0) < 15  # the same morning in Italy, roughly
+    d = np.zeros((3, desc.N_FIELDS), np.float32)
+    d[:2, light.NOISE] = [np.log10(0.01) + 3, np.log10(0.02) + 3]  # two bands known
+    d[:2, light.KNOWN_NOISE] = 1
+    assert light.snr(d) == pytest.approx((5.0, 25.0))  # 0.05 / 0.01, 0.5 / 0.02
+    assert light.snr(np.zeros((3, desc.N_FIELDS), np.float32)) == (None, None)
+
+
+def test_window_by_window_on_the_command(data, tmp_path):
+    torch = pytest.importorskip("torch")
+    from catena import train_clarity as C
+    from catena.model import Clarity
+
+    runs = tmp_path / "runs"
+    config = {"args": {"widths": [8, 8, 8, 8], "stem": 8}}
+    torch.manual_seed(0)
+    net = Clarity(widths=(8, 8, 8, 8), stem=8, fields=desc.N_CARD)
+    (runs / "seed0").mkdir(parents=True)
+    C.save(runs / "seed0" / "final.pt", 1, {"real": net, "sim": copy.deepcopy(net)}, config)
+    out, windows = tmp_path / "a.csv", tmp_path / "windows.csv"
+    args = [str(runs), "--data", str(data), "--device", "cpu", "--workers", "0", "--tests", "A"]
+    args += ["--windows", "3", "--a-size", "48", "--batch", "2", "--out", str(out)]
+    E.main(
+        [*args, "--cameras", "sentinel2", "rgbn_10m_mtf0.3_snr150", "--per-window", str(windows)]
+    )
+    with open(out, newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert {r["scene"] for r in rows} == {"sentinel2", "rgbn_10m_mtf0.3_snr150"}
+    with open(windows, newline="") as f:
+        each = list(csv.DictReader(f))
+    assert list(each[0]) == list(E.WINDOW_COLUMNS) and {r["camera"] for r in each} == {"sentinel2"}
+    for model in ("seed0/real", "seed0/sim"):
+        mine = [r for r in each if r["model"] == model]
+        assert sorted(int(r["window"]) for r in mine) == [0, 1, 2]
+        assert all(r["patch"] and np.isfinite(float(r["sun_zenith"])) for r in mine)
+        summed = sum(np.array(r["confusion"].split(), int) for r in mine)
+        (whole,) = [r for r in rows if r["scene"] == "sentinel2" and r["model"] == model]
+        assert summed.tolist() == [int(v) for v in whole["confusion"].split()][:16]
+    with pytest.raises(SystemExit):
+        E.main([*args, "--cameras", "no_such_camera"])
+    with pytest.raises(SystemExit):
+        E.parse_args([str(runs), "--cameras", "sentinel2"])  # without --out
+
+
 def test_default_out(tmp_path):
     assert E.default_out(tmp_path, list(E.TESTS), False) == tmp_path / "clarity_tests.csv"
     checks = ["honest", "shuffled"]
