@@ -2,7 +2,7 @@
 
     python -m catena.train_clarity OUT [--data /root/catena_data] [--seed 0] [--steps 60000]
         [--arms real sim] [--shares 0.4 0.2 0.2 0.2] [--devices cuda:0 cuda:1]
-        [--q-weights 1 1 1] [--faults 0] [--fault-gain 0.3] [--fault-nir 0.4]
+        [--q-weights 1 1 1] [--faults 0] [--fault-gain 0.3] [--fault-nir 0.4] [--coarser 0]
         [--chain-jitter 1] [--trunk CODE [CODE]]
 
 Clarity reads, for each band, only what every product states (catena.descriptor.card): its
@@ -53,6 +53,15 @@ So real and sim differ only in the made-up cameras. Two options change sim's sam
                that no product states (catena.sim.calibration_fault): up to --fault-nir of
                near infrared leaking into each visible band, and every band's gain off by up
                to --fault-gain, as IRIDE Eaglet II delivers its bands. Not on the card.
+
+One option changes what every arm learns from, made-up cameras or not:
+  --coarser    the share of the batches from Landsat 8, HEO and PeruSat-1 shown at a pixel 2
+               or 3 times larger (Landsat 8: 2 only), as a coarser camera would deliver them:
+               the image averaged over 2 x 2 or 3 x 3 pixels, the label the most common code
+               of each block, and the card told the new pixel (gsd, sampling, a known blur
+               narrower, a known noise lower). Without it each real satellite has one pixel
+               size, which the networks learn as a name; with it the pixel size says what it
+               means. Drawn from a random stream of its own: at 0 every sample is as before.
 
 Each batch comes from one satellite, drawn with --shares (Sentinel-2, Landsat 8, HEO,
 PeruSat-1); the data under DATA:
@@ -114,6 +123,10 @@ NIR_LEAK = {  # per satellite: the visible bands a fault mixes near infrared int
     "heo": ((1, 2, 3), 7),  # B01-B03; B07
     "perusat1": ((0, 1, 2), 3),  # blue, green, red; nir
 }
+COARSER = {"landsat8": (2,), "heo": (2, 3), "perusat1": (2, 3)}  # --coarser: pixel factors
+SAMPLING, PSF = desc.FIELDS.index("sampling"), desc.FIELDS.index("psf")
+NOISE = [desc.FIELDS.index("noise_dark"), desc.FIELDS.index("noise_bright")]
+KNOWN_NOISE = desc.FIELDS.index("known_noise")
 RGBN = {  # where blue, green, red and near infrared sit among each satellite's bands
     "sentinel2": (1, 2, 3, 7),  # B02, B03, B04, B08
     "landsat8": (1, 2, 3, 4),  # B2, B3, B4, B5
@@ -125,7 +138,9 @@ RGBN = {  # where blue, green, red and near infrared sit among each satellite's 
 SAME_ARGS = ("seed", "steps", "batch", "size", "landsat_size", "heo_size", "perusat_size")
 SAME_ARGS += ("shares", "p_s2", "widths", "stem", "lr", "weight_decay", "warmup", "hold_out")
 SAME_ARGS += ("q_weights", "faults", "fault_gain", "fault_nir", "arms", "chain_jitter", "trunk")
+SAME_ARGS += ("coarser",)
 OLDER = {"q_weights": [1.0, 1.0, 1.0], "faults": 0.0, "fault_gain": 0.3, "fault_nir": 0.4}
+OLDER |= {"coarser": 0.0}
 OLDER |= {"arms": list(VERSIONS), "chain_jitter": 1.0, "trunk": None}
 
 
@@ -204,7 +219,8 @@ class Samples(Dataset):
     version gets faults); its own image and label are then small placeholders. The real
     version's samples do not depend on q_weights, faults, fixed or chain_jitter, and the sim
     version's images not on fixed or chain_jitter: they are drawn first, and the rest from
-    random streams of its own."""
+    random streams of its own. With coarser, a share of the batches from Landsat 8, HEO and
+    PeruSat-1 come at a pixel 2 or 3 times larger (coarsened), for every version."""
 
     def __init__(
         self,
@@ -225,8 +241,10 @@ class Samples(Dataset):
         fault_nir: float = 0.4,
         fixed: bool = False,
         chain_jitter: float = 1.0,
+        coarser: float = 0.0,
     ) -> None:
         self.windows, self.batch, self.seed = windows, batch, seed
+        self.coarser = coarser
         self.data = {"landsat8": landsat, "heo": heo_windows, "perusat1": peru}
         self.shares = np.asarray(shares, np.float64) / float(np.sum(shares))
         for name, share in zip(SOURCES, self.shares, strict=True):
@@ -260,6 +278,18 @@ class Samples(Dataset):
         """Where sample i comes from: the same for a whole batch (i // batch)."""
         rng = np.random.default_rng([self.seed, 3, i // self.batch])
         return SOURCES[int(rng.choice(len(SOURCES), p=self.shares))]
+
+    def coarser_factor(self, i: int, source: str, size: int) -> int:
+        """How many times larger the pixels of sample i are shown (--coarser): 1, or a factor
+        of COARSER that divides its windows of `size` pixels into a multiple of 8, the same
+        for its whole batch (i // batch), from a random stream of its own."""
+        if self.coarser <= 0 or source not in COARSER:
+            return 1
+        rng = np.random.default_rng([self.seed, 6, i // self.batch])
+        if rng.random() >= self.coarser:
+            return 1
+        fits = [f for f in COARSER[source] if size % f == 0 and (size // f) % 8 == 0]
+        return int(rng.choice(fits)) if fits else 1
 
     def pixel_size(self, i: int) -> int:
         """The q of the sim version's Sentinel-2 sample i, shared by its batch."""
@@ -387,6 +417,9 @@ class Samples(Dataset):
             out = self.from_heo(rng, frng)
         else:
             out = self.from_perusat1(rng, frng)
+        f = self.coarser_factor(i, source, out["image"].shape[-1])
+        if f > 1:
+            out = coarsened(out, f)
         n = int(out["real"].sum())
         drop = np.random.default_rng([self.seed, 4, i])  # the chain arm's dropout and errors
         hidden = out.pop("sim_desc").copy()
@@ -398,6 +431,52 @@ class Samples(Dataset):
         out["sim_told"] = desc.chain_card(hidden)
         out["hid_told"] = desc.chain_card(shown)
         return out | {"source": SOURCES.index(source)}
+
+
+def block_mean(x: np.ndarray, f: int) -> np.ndarray:
+    """x (..., h, w) averaged over f x f pixels: (..., h / f, w / f), its own dtype."""
+    h, w = x.shape[-2:]
+    return x.reshape(*x.shape[:-2], h // f, f, w // f, f).mean((-3, -1)).astype(x.dtype)
+
+
+def coarse_label(label: np.ndarray, f: int) -> np.ndarray:
+    """A label (h, w) of codes 0-5 on a grid f times coarser: the most common code of each
+    f x f block, or no label where fewer than half of the block's pixels have one."""
+    h, w = label.shape
+    blocks = label.reshape(h // f, f, w // f, f).transpose(0, 2, 1, 3).reshape(h // f, w // f, -1)
+    counts = np.stack([(blocks == c).sum(-1) for c in range(len(T.SETS))], -1)
+    out = counts.argmax(-1).astype(label.dtype)
+    out[counts.sum(-1) < f * f / 2] = T.NO_LABEL
+    return out
+
+
+def coarse_card(d: np.ndarray, f: int) -> np.ndarray:
+    """Descriptors (bands, 15) of bands averaged into pixels f times larger: the grid's pixel
+    f times larger, a band's own pixel against it smaller (never below the grid's), a known
+    blur f times narrower in the new pixels, a known noise f times lower. A copy; an empty
+    slot (all 0) gets the new pixel size only, which no network reads there."""
+    d = d.copy()
+    d[:, desc.GSD] += math.log2(f)
+    d[:, SAMPLING] = np.maximum(d[:, SAMPLING] - math.log2(f), 0)
+    d[:, PSF] /= f  # an unknown blur (0) stays 0
+    d[:, NOISE] -= math.log10(f) * d[:, KNOWN_NOISE : KNOWN_NOISE + 1]
+    return d
+
+
+def coarsened(out: dict, f: int) -> dict:
+    """A sample as delivered (Samples.as_delivered) at a pixel f times larger, every version
+    alike; the sim version's placeholders stay placeholders."""
+    out = dict(out)
+    out["image"] = block_mean(out["image"], f)
+    out["label"] = coarse_label(out["label"], f)
+    out["desc"] = coarse_card(out["desc"], f)
+    out["sim_desc"] = coarse_card(out["sim_desc"], f)
+    if not out["same"]:
+        out["sim_image"] = block_mean(out["sim_image"], f)
+        out["sim_label"] = coarse_label(out["sim_label"], f)
+    if "fixed_image" in out:
+        out["fixed_image"] = block_mean(out["fixed_image"], f)
+    return out
 
 
 def arm_inputs(batch: dict, name: str) -> tuple:
@@ -607,6 +686,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--chain-jitter", type=float, default=1.0, help="chain: errors of the MTF and SNR, 0-1"
     )
+    p.add_argument(
+        "--coarser", type=float, default=0.0, help="share of real satellites' batches coarser"
+    )
     p.add_argument("--trunk", nargs="+", help="nas, nas2: their architecture codes (catena.nas)")
     p.add_argument("--widths", type=int, nargs=4, default=[32, 64, 128, 256])
     p.add_argument("--stem", type=int, default=16)
@@ -634,6 +716,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p.error("--faults: the fixed arm takes none")
     if args.chain_jitter < 0:
         p.error("--chain-jitter: 0 or more")
+    if not 0 <= args.coarser <= 1:
+        p.error("--coarser within 0 and 1")
+    if args.coarser > 0 and any(
+        getattr(args, k) % 16 for k in ("landsat_size", "heo_size", "perusat_size")
+    ):
+        p.error("--coarser: --landsat-size, --heo-size and --perusat-size multiples of 16")
     if len(args.trunk or []) != sum(a in NAS for a in args.arms):
         p.error("--trunk: one architecture code for each nas arm, none without")
     return args
@@ -723,6 +811,10 @@ def main(argv: list[str] | None = None) -> None:
                 "nir_share_up_to": args.fault_nir,
                 "bands": {k: {"visible": list(v), "nir": n} for k, (v, n) in NIR_LEAK.items()},
             },
+            "coarser_pixels": {
+                "share_of_batches": args.coarser,
+                "factors": {k: list(v) for k, v in COARSER.items()},
+            },
             "landsat_scenes": [s.name for s in data["landsat8"].scenes] if data["landsat8"] else [],
             "heo_scenes": [s.name for s in data["heo"].scenes] if data["heo"] else [],
             "validation_cameras": [c[0] for c in T.VAL_CAMERAS],
@@ -746,6 +838,7 @@ def main(argv: list[str] | None = None) -> None:
         fault_nir=args.fault_nir,
         fixed="fixed" in arms,
         chain_jitter=args.chain_jitter,
+        coarser=args.coarser,
     )
     val_data = T.ValSamples(loader.GridWindows(s2, "validation", size=args.size), args.val_windows)
     pin = any(dev.type == "cuda" for dev in devices.values())
@@ -800,6 +893,12 @@ def main(argv: list[str] | None = None) -> None:
             f"  calibration faults: sim only, {args.faults:.0%} of every satellite's samples: "
             f"up to {args.fault_nir:.0%} near infrared in the visible bands, gains within "
             f"+-{args.fault_gain:.0%}; not on the card",
+            flush=True,
+        )
+    if args.coarser > 0:
+        print(
+            f"  coarser pixels: every arm, {args.coarser:.0%} of the batches from Landsat 8 "
+            "(x2), HEO and PeruSat-1 (x2 or x3), the card told the new pixel",
             flush=True,
         )
     if step:

@@ -338,6 +338,61 @@ def test_what_the_arms_of_real_samples_see(data):
     assert parted > 0  # chain learns from the made-up cameras, chain_real never
 
 
+def test_coarse_labels_and_cards():
+    label = np.array([[0, 0, 4, 4], [0, 1, 4, 255], [5, 5, 255, 255], [5, 3, 255, 2]])
+    assert C.coarse_label(label, 2).tolist() == [[0, 4], [5, 255]]  # codes 4, 5 kept
+    x = np.arange(2 * 6 * 6, dtype=np.float32).reshape(2, 6, 6)
+    small = C.block_mean(x, 3)
+    assert small.shape == (2, 2, 2) and small.dtype == np.float32
+    assert small[1, 0, 1] == pytest.approx(x[1, 0:3, 3:6].mean())
+    d = np.zeros((3, C.desc.N_FIELDS), np.float32)
+    d[:, C.desc.GSD] = np.log2(0.5)  # 5 m
+    d[:, C.SAMPLING] = [0, 1, 0]
+    d[:, C.PSF] = [0.9, 0, 0.6]
+    d[:, C.NOISE] = [[1.0, 1.5], [0.0, 0.0], [0.8, 1.2]]
+    d[:, C.KNOWN_NOISE] = [1, 0, 1]
+    before = d.copy()
+    c = C.coarse_card(d, 3)
+    assert c[:, C.desc.GSD] == pytest.approx(np.log2(1.5))  # 15 m
+    assert c[:, C.SAMPLING].tolist() == [0, 0, 0] and c[:, C.PSF] == pytest.approx([0.3, 0, 0.2])
+    lower = np.log10(3)
+    want = np.array([[1 - lower, 1.5 - lower], [0, 0], [0.8 - lower, 1.2 - lower]])
+    assert np.allclose(c[:, C.NOISE], want)
+    assert np.array_equal(c[:, :4], d[:, :4]) and np.array_equal(d, before)  # a copy
+
+
+def test_coarser_pixels_of_the_real_satellites(data):
+    plain, coarse = samples(data, shares=QUARTERS), samples(data, shares=QUARTERS, coarser=1.0)
+    off = samples(data, shares=QUARTERS, coarser=0.0)
+    seen = set()
+    for i in range(240):
+        a, b, c = plain[i], coarse[i], off[i]
+        for key, value in a.items():
+            assert np.array_equal(value, c[key])  # at 0, every sample as before
+        source = C.SOURCES[a["source"]]
+        if source == "sentinel2":
+            for key, value in a.items():
+                assert np.array_equal(value, b[key])  # Sentinel-2 as before
+            continue
+        f = a["image"].shape[-1] // b["image"].shape[-1]
+        assert f == 2 and b["image"].shape[-1] * 2 == SMALL  # 16 px: only x2 makes 8
+        seen.add(source)
+        n = int(a["real"].sum())
+        assert np.allclose(b["image"], C.block_mean(a["image"], 2))
+        assert np.array_equal(b["label"], C.coarse_label(a["label"], 2))
+        assert b["told"][:n, 5] == pytest.approx(a["told"][:n, 5] + 1)  # gsd: 2 x the pixel
+        assert np.array_equal(b["told"][:n, :4], a["told"][:n, :4])
+        assert b["same"] == a["same"] and np.array_equal(b["real"], a["real"])
+        if b["same"]:
+            assert np.array_equal(b["sim_told"], b["hid_told"])
+    assert seen == {"landsat8", "heo", "perusat1"}
+    some = samples(data, shares=QUARTERS, coarser=0.5)
+    sizes = {some[i]["image"].shape[-1] for i in range(240) if some.source(i) != "sentinel2"}
+    assert sizes == {SMALL, SMALL // 2}
+    for b in range(0, 240, 4):  # one pixel size per batch
+        assert len({some[b + k]["image"].shape for k in range(4)}) == 1
+
+
 def test_the_arms():
     made_up = {"sim", "sensei", "chain", "blind", "fixed", "nas", "nas2"}
     delivered = {"real", "sensei_real", "chain_real", "blind_real"}  # never a made-up camera
@@ -454,6 +509,18 @@ def test_short_runs_as_delivered_without_heo(data, tmp_path):
     state = torch.load(tmp_path / "told/final.pt", map_location="cpu")
     assert state["models"]["sensei_real"]["bands.embed.0.weight"].shape[1] == 4
     assert state["arms"]["blind_real"] == {"data": "real", "fields": 6, "blind": True}
+
+
+def test_a_short_run_with_coarser_pixels(data, tmp_path):
+    C.main(run_args(data, tmp_path / "run", "--arms", "real", "sim", "--coarser", "0.5"))
+    config = json.loads((tmp_path / "run/config.json").read_text())
+    assert config["coarser_pixels"]["share_of_batches"] == 0.5
+    assert config["coarser_pixels"]["factors"]["heo"] == [2, 3]
+    state = torch.load(tmp_path / "run/final.pt", map_location="cpu")
+    assert state["step"] == 4
+    for bad in (["--coarser", "1.5"], ["--coarser", "0.5", "--heo-size", "24"]):
+        with pytest.raises(SystemExit):
+            C.parse_args(run_args(data, tmp_path / "bad", *bad))
 
 
 def test_the_versions_part_on_sentinel2(data, tmp_path):
