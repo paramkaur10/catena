@@ -693,6 +693,100 @@ def test_a_coarser_grid_and_8_bits_on_the_command(data, tmp_path):
     assert {r["test"] for r in rows} == {"A", "F"}
 
 
+def test_a_sensors_own_batch_norm_statistics():
+    torch = pytest.importorskip("torch")
+    from catena.model import Clarity
+
+    torch.manual_seed(0)
+    hailo = Clarity(widths=(8, 8, 8, 8), stem=8, fields=desc.N_CARD, hailo=True).eval()
+    plain = Clarity(widths=(8, 8, 8, 8), stem=8, fields=desc.N_CARD).eval()
+    nets = {"seed0/flight": E.Net(hailo, desc.N_CARD), "seed0/sim": E.Net(plain, desc.N_CARD)}
+    own = E.OwnNorms(nets, amp=False)
+    assert own and set(own.nets) == {"seed0/flight"}  # GroupNorm has nothing to measure
+    assert not E.OwnNorms({"seed0/sim": nets["seed0/sim"]}, amp=False)
+    layer = own.layers["seed0/flight"][0]
+    trained = {k: v.clone() for k, v in layer.state_dict().items()}
+    weights = {k: v.clone() for k, v in hailo.state_dict().items() if "running" not in k}
+    told = torch.zeros(4, 3, desc.N_CHAIN_CARD)
+    told[..., 1] = torch.tensor([0.5, 1.0, 1.5])  # three bands told apart
+    real = torch.ones(4, 3, dtype=torch.bool)
+    own.begin()
+    assert layer.training and layer.momentum is None and int(layer.num_batches_tracked) == 0
+    for k in range(3):
+        own.see(
+            0.2 + 0.1 * torch.rand(4, 3, 24, 24, generator=torch.Generator().manual_seed(k)),
+            told,
+            real,
+        )
+    own.end()
+    assert not layer.training and own.seen == 12 and int(layer.num_batches_tracked) == 3
+    assert not torch.allclose(layer.running_mean, trained["running_mean"])
+    for k, v in hailo.state_dict().items():  # only the statistics moved
+        if "running" not in k and "num_batches" not in k:
+            assert torch.equal(v, weights[k])
+    measured = layer.running_mean.clone()
+    own.restore()
+    for k, v in layer.state_dict().items():
+        assert torch.equal(v, trained[k])
+    assert layer.momentum == 0.1 and not layer.training
+    own.begin()  # measured again: the same images give the same statistics
+    for k in range(3):
+        own.see(
+            0.2 + 0.1 * torch.rand(4, 3, 24, 24, generator=torch.Generator().manual_seed(k)),
+            told,
+            real,
+        )
+    own.end()
+    assert torch.allclose(layer.running_mean, measured)
+    own.restore()
+
+
+def test_the_tiles_a_sensors_statistics_come_from():
+    image = np.zeros((2, 300, 600), np.float32)
+    image[:, :, 200:] = 1.0  # a third of the scene without data
+    item = E.Item("scene", image, np.zeros((2, 11), np.float32), np.zeros((300, 600), np.uint8))
+    padded, tiles = E.norm_tiles(item, most=3)
+    assert padded.shape == (2, 300, 600) and len(tiles) == 3
+    for r, c in tiles:
+        assert E.valid_share(padded[:, r : r + 240, c : c + 240]) >= 0.5
+    _, every = E.norm_tiles(item, most=100)
+    assert len(every) == len(set(every)) and all(c >= 60 for _, c in every)
+    small = E.Item("small", np.ones((2, 100, 120), np.float32), item.told, item.label[:100, :120])
+    padded, tiles = E.norm_tiles(small)
+    assert padded.shape == (2, 240, 240) and tiles == []  # padded: less than half valid
+    assert E.valid_share(np.array([[[1.0, np.nan]], [[1.0, 2.0]]])) == 0.5
+
+
+def test_own_batch_norm_statistics_on_the_command(data, tmp_path, capsys):
+    torch = pytest.importorskip("torch")
+    from catena import train_clarity as C
+
+    runs = tmp_path / "flight"
+    (runs / "seed0").mkdir(parents=True)
+    torch.manual_seed(0)
+    models = {a: C.build(a, (8, 8, 8, 8), 8, hailo=True) for a in ("sim", "fixed")}
+    config = {"args": {"widths": [8, 8, 8, 8], "stem": 8, "hailo": True}}
+    C.save(runs / "seed0/final.pt", 1, models, config)
+    args = [str(runs), "--data", str(data), "--device", "cpu", "--workers", "0", "--tests", "A"]
+    args += ["D", "F", "--windows", "2", "--a-size", "48", "--batch", "4", "--cameras"]
+    args += ["sentinel2", "--out", str(tmp_path / "own.csv"), "--norms", "own"]
+    E.main([*args, "--norm-tiles", "2"])
+    out = capsys.readouterr().out
+    assert "each sensor's own BatchNorm statistics for seed0/sim, seed0/fixed" in out
+    assert "D heo_test: own BatchNorm statistics" in out and "F perusat1: own" in out
+    with open(tmp_path / "own.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert {r["test"] for r in rows} == {"A", "D", "F"}
+    assert {"seed0/sim", "seed0/fixed"} <= {r["model"] for r in rows}
+    state = torch.load(runs / "seed0/final.pt", map_location="cpu")  # the run is untouched
+    for k, v in state["models"]["sim"].items():
+        assert torch.equal(v, models["sim"].state_dict()[k])
+    with pytest.raises(SystemExit):
+        E.parse_args([str(runs), "--norms", "own", "--int8"])
+    with pytest.raises(SystemExit):
+        E.parse_args([str(runs), "--norm-tiles", "0"])
+
+
 def test_thresholds_and_scrambled_pixels_on_the_command(data, tmp_path):
     torch = pytest.importorskip("torch")
     from catena import threshold
@@ -910,3 +1004,7 @@ def test_default_out(tmp_path):
     assert eight.name == "clarity_tests_ABCDEF_int8.csv"
     floor = E.default_out(tmp_path, list(E.TESTS), True, ["honest"], True, threshold=True)
     assert floor.name == "clarity_tests_ABCDEF_ocm_sensei_threshold.csv"
+    own = E.default_out(tmp_path, ["B", "C", "D", "E", "F"], False, norms="own")
+    assert own.name == "clarity_tests_BCDEF_ownnorms.csv"
+    both = E.default_out(tmp_path, ["D"], False, grid=10, threshold=True, norms="own")
+    assert both.name == "clarity_tests_D_grid10_ownnorms_threshold.csv"

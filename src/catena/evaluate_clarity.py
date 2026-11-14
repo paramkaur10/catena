@@ -5,7 +5,7 @@ test the method) on six test sets, beside OmniCloudMask wherever its predictions
         [--tests A B C D E F] [--device cuda:0] [--windows 800] [--ocm] [--sensei] [--maps DIR]
         [--out CSV] [--cards honest shuffled "pixel x3" ... "pixels scrambled" "binned x3"]
         [--grid 10] [--cameras sentinel2 ...] [--per-window FILE.csv]
-        [--int8] [--threshold RUNS/threshold/threshold.json]
+        [--int8] [--threshold RUNS/threshold/threshold.json] [--norms own] [--norm-tiles 64]
 
 Each RUNS folder holds finished runs (final.pt) at any depth, one folder per seed, as
 scripts/big.sh makes them (runs/big/seed0, or runs/arms/chain/seed0 for OUT=runs/arms/chain);
@@ -131,6 +131,18 @@ same pixels are scored. Sets are named <set>@10m; the CSV clarity_tests_<tests>_
 8 bits (--int8): each network's 8-bit twin instead of it, named <model>@int8: PyNAS's
 simulation of the Hailo-8 contract on what runs on board for a fixed sensor, calibrated on
 the validation cameras (catena.onboard). The CSV clarity_tests_<tests>_int8.csv.
+
+A sensor's own BatchNorm statistics (--norms own): a network made for the Hailo-8 normalizes
+with BatchNorm, whose statistics are constants once trained. Each training batch comes from
+one satellite, so a trained network has learnt them per satellite and is given one average
+of them all. With --norms own, every network with BatchNorm layers gets the statistics of the
+sensor at hand before that sensor is scored: a plain average over its batches of the set's
+own images, read as the network reads them (at most --norm-tiles tiles of each scene of B-F,
+spread over it, each at least half valid; for Test A each camera's own windows), in batches
+of 16 windows as in training. No label is read. On board they are constants for one sensor,
+measured on the ground from its images and folded into the convolutions as the cards are.
+After each set or camera the trained statistics come back; a network without BatchNorm is
+scored as it is. The CSV clarity_tests_<tests>_ownnorms.csv (not with --int8).
 """
 
 from __future__ import annotations
@@ -192,6 +204,9 @@ OCM = {
 BASELINES = OCM | {"sensei2": "SEnSeIv2", "threshold": "Thresholds (depth-4 tree)"}
 SCRAMBLED = "pixels scrambled"  # the check of the image (the others are of the card)
 BINNED = {"binned x2": 2, "binned x3": 3}  # Test A: k x k pixels averaged before the network
+NORMS = ("trained", "own")  # --norms: BatchNorm's statistics as trained, or the sensor's own
+NORM_TILES = 64  # --norms own: at most these tiles of each scene its statistics come from
+NORM_BATCH = 16  # their windows per batch, as in training
 SENSEI_MODEL = "SEnSeIv2-SegFormerB2-alldata-ambiguous"
 SENSEI_CODES = np.array([0, 2, 1, 3], np.uint8)  # its clear, thick, thin, shadow in our codes
 
@@ -895,6 +910,108 @@ def classifier(nets: dict[str, Net], device, amp: bool):
     return classify
 
 
+class OwnNorms:
+    """The BatchNorm statistics of the sensor at hand for every network that has BatchNorm
+    layers (--norms own). begin() keeps each network's trained statistics and clears them;
+    every batch see() is shown adds to a plain average (the layers in training mode, nothing
+    else changes: no gradient, no weight); end() puts the layers back to inference with the
+    new statistics; restore() brings back the trained ones."""
+
+    def __init__(self, nets: dict, amp: bool):
+        from catena.train_clarity import batch_norms
+
+        self.layers = {m: found for m, e in nets.items() if (found := batch_norms(e.net))}
+        self.nets = {m: nets[m] for m in self.layers}
+        self.amp = amp
+        self.kept: dict = {}
+        self.seen = 0
+
+    def __bool__(self) -> bool:
+        return bool(self.layers)
+
+    def begin(self) -> None:
+        self.kept = {
+            m: [({k: v.clone() for k, v in x.state_dict().items()}, x.momentum) for x in found]
+            for m, found in self.layers.items()
+        }
+        for found in self.layers.values():
+            for x in found:
+                x.reset_running_stats()
+                x.momentum = None  # a plain average of the batches
+                x.train()
+        self.seen = 0
+
+    def see(self, image, told, real, four=None) -> None:
+        """One batch (torch, on the networks' device), as run_nets() takes it."""
+        import torch
+
+        with torch.no_grad():
+            run_nets(self.nets, image, told, real, four, self.amp)
+        self.seen += int(image.shape[0])
+
+    def end(self) -> None:
+        for found in self.layers.values():
+            for x in found:
+                x.eval()
+
+    def restore(self) -> None:
+        for m, found in self.layers.items():
+            for x, (state, momentum) in zip(found, self.kept.get(m, ()), strict=False):
+                x.load_state_dict(state)
+                x.momentum = momentum
+                x.eval()
+
+
+def valid_share(tile: np.ndarray) -> float:
+    """The share of a tile's pixels (bands, h, w) where every band holds data (non-zero and
+    finite): no label read."""
+    return float(np.mean(np.all((tile != 0) & np.isfinite(tile), axis=0)))
+
+
+def norm_tiles(item: Item, most: int = NORM_TILES) -> tuple[np.ndarray, list[tuple[int, int]]]:
+    """The scene's image (padded to a tile as predict() pads it) and up to `most` tiles of it
+    to measure BatchNorm's statistics on: spread evenly over its tiles, each at least half
+    valid."""
+    image, size = item.image, item.tile
+    _, h, w = image.shape
+    height, width = max(h, size), max(w, size)
+    if (height, width) != (h, w):
+        image = np.pad(image, ((0, 0), (0, height - h), (0, width - w)))
+    every = [
+        (r, c) for r in starts(height, size, item.margin) for c in starts(width, size, item.margin)
+    ]
+    looked = every[:: max(1, len(every) // (4 * most))]  # candidates spread over the scene
+    good = [(r, c) for r, c in looked if valid_share(image[:, r : r + size, c : c + size]) >= 0.5]
+    if len(good) > most:
+        good = [good[i * len(good) // most] for i in range(most)]
+    return image, good
+
+
+def scene_norms(own: OwnNorms, ts: SceneSet, device, most: int = NORM_TILES) -> tuple[int, int]:
+    """BatchNorm's statistics measured on a set's own scenes (on the coarser grid with
+    --grid), up to `most` tiles of each: (tiles, scenes) seen."""
+    import torch
+
+    tiles = scenes = 0
+    for item in ts.items():
+        work = item.coarse if item.coarse is not None else item
+        image, picked = norm_tiles(work, most)
+        if not picked:
+            continue
+        scenes += 1
+        size = work.tile
+        for k in range(0, len(picked), NORM_BATCH):
+            part = picked[k : k + NORM_BATCH]
+            x = np.stack([image[:, r : r + size, c : c + size] for r, c in part])
+            rho = torch.from_numpy(np.ascontiguousarray(work.to_rho(x), np.float32)).to(device)
+            told = np.ascontiguousarray(work.told, np.float32)
+            cards = torch.from_numpy(told).to(device).expand(len(part), -1, -1)
+            real = torch.ones(rho.shape[:2], dtype=torch.bool, device=device)
+            own.see(rho, cards, real, work.rgbn)
+            tiles += len(part)
+    return tiles, scenes
+
+
 def tally(conf: dict, key: str, classes, y) -> None:
     """A batch of Test A's windows added to conf[key], a 4 x 4 confusion (torch): y the labels,
     classes the predicted, both (n, h, w)."""
@@ -934,12 +1051,14 @@ def cameras(
     rule=None,
     only=None,
     per_window: Path | None = None,
+    own: OwnNorms | None = None,
 ):
     """Test A: {camera name: {model: 6 x 4 confusion matrix}}, one camera at a time, each
     model under every check (named <model>@<check>; a binned check only where the camera's
     windows divide); rule (catena.threshold.Rule) beside them, as "threshold". only: the
     names of the cameras to run (None: all). per_window: a CSV of Sentinel-2 as delivered,
-    window by window (WINDOW_COLUMNS)."""
+    window by window (WINDOW_COLUMNS). own: BatchNorm's statistics measured on each camera's
+    own windows first (--norms own)."""
     import torch
     from torch.utils.data import DataLoader
 
@@ -970,6 +1089,13 @@ def cameras(
         conf: dict = {}
         four = rgbn_slots(camera[2])
         bands = len(camera[2])  # the camera's bands fill the first slots of every window
+        if own:
+            own.begin()
+            for b in batches:  # the camera's own windows, no label read
+                x = b["image"][:, :bands].to(device, non_blocking=True)
+                told = desc.chain_card(b["d_told"][:, :bands]).to(device, non_blocking=True)
+                own.see(x, told, torch.ones(x.shape[:2], dtype=torch.bool, device=device), four)
+            own.end()
         with torch.no_grad():
             for k, b in enumerate(batches):
                 x = b["image"][:, :bands].to(device, non_blocking=True)
@@ -1015,6 +1141,8 @@ def cameras(
                                         "confusion": " ".join(str(int(v)) for v in m.ravel()),
                                     }
                                 )
+        if own:
+            own.restore()
         found[camera[0]] = {}
         for model, m in conf.items():
             six = np.zeros((6, 4), np.int64)
@@ -1242,11 +1370,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--cameras", nargs="+", help="Test A: only these cameras")
     p.add_argument("--per-window", type=Path, help="Test A: Sentinel-2 window by window, a CSV")
     p.add_argument("--int8", action="store_true", help="each network's 8-bit twin instead of it")
+    p.add_argument(
+        "--norms",
+        choices=NORMS,
+        default="trained",
+        help="BatchNorm's statistics: as trained, or each sensor's own (above)",
+    )
+    p.add_argument("--norm-tiles", type=int, default=NORM_TILES, help="--norms own: per scene")
     args = p.parse_args(argv)
     if args.a_size <= 0 or args.a_size % 24:
         p.error("--a-size must be a multiple of 24: of 8 at 10 m and at 30 m")
     if (args.cameras or args.per_window) and not args.out:
         p.error("--cameras and --per-window: name the CSV with --out")
+    if args.norms == "own" and args.int8:
+        p.error("--norms own measures the float networks: not with --int8")
+    if args.norm_tiles < 1:
+        p.error("--norm-tiles must be at least 1")
     return args
 
 
@@ -1259,17 +1398,21 @@ def default_out(
     grid=None,
     int8=False,
     threshold=False,
+    norms="trained",
 ) -> Path:
     """In the (last) RUNS folder: clarity_tests.csv for the six tests, plainly told,
-    clarity_tests_<tests>[_ocm][_cards][_sensei][_grid<m>][_int8][_threshold].csv otherwise."""
+    clarity_tests_<tests>[_ocm][_cards][_sensei][_grid<m>][_int8][_ownnorms][_threshold].csv
+    otherwise."""
     folder = Path(runs if isinstance(runs, str | Path) else runs[-1])
     checks = list(cards) != ["honest"]
+    own = norms == "own"
     plain = not ocm and not checks and not sensei and not grid and not int8 and not threshold
+    plain = plain and not own
     if set(tests) == set(TESTS) and plain:
         return folder / "clarity_tests.csv"
     more = ("_ocm" if ocm else "") + ("_cards" if checks else "") + ("_sensei" if sensei else "")
     more += (f"_grid{grid:g}" if grid else "") + ("_int8" if int8 else "")
-    more += "_threshold" if threshold else ""
+    more += ("_ownnorms" if own else "") + ("_threshold" if threshold else "")
     return folder / f"clarity_tests_{''.join(sorted(tests))}{more}.csv"
 
 
@@ -1287,8 +1430,22 @@ def main(argv: list[str] | None = None) -> None:
         nets = onboard.int8_twins(nets, args.data, device, args.workers, size=args.a_size)
     tests = [t for t in TESTS if t in args.tests]
     out = args.out or default_out(
-        args.runs, tests, args.ocm, args.cards, args.sensei, args.grid, args.int8, args.threshold
+        args.runs,
+        tests,
+        args.ocm,
+        args.cards,
+        args.sensei,
+        args.grid,
+        args.int8,
+        args.threshold,
+        args.norms,
     )
+    own = OwnNorms(nets, amp) if args.norms == "own" else None
+    if own is not None:
+        if own:
+            print(f"each sensor's own BatchNorm statistics for {', '.join(own.nets)}", flush=True)
+        else:
+            print("--norms own: no network has BatchNorm layers; each is scored as it is")
     rule = None
     if args.threshold:
         from catena import threshold
@@ -1322,6 +1479,7 @@ def main(argv: list[str] | None = None) -> None:
                 rule,
                 args.cameras,
                 args.per_window,
+                own,
             )
             keep(*camera_lines(found, args.a_size))
         else:
@@ -1347,10 +1505,22 @@ def main(argv: list[str] | None = None) -> None:
         sets = [on_grid(ts, args.grid) for ts in sets]
     for ts in sets:
         try:
+            if own:
+                own.begin()
+                tiles, scenes = scene_norms(own, ts, device, args.norm_tiles)
+                own.end()
+                print(
+                    f"  {ts.test} {ts.name}: own BatchNorm statistics, {tiles} tiles of "
+                    f"{scenes} scenes",
+                    flush=True,
+                )
             keep(*score_set(ts, classify, args.maps, args.cards, extra if extras else None))
         except Exception:  # one broken set must not cost the others
             traceback.print_exc()
             print(f"test {ts.test}: {ts.name} stopped by the error above; the rest go on")
+        finally:
+            if own:
+                own.restore()
     if not rows:
         raise SystemExit("nothing was scored")
     print("\n\nAll the tests:" + "\n".join(report))
